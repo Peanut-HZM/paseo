@@ -25,6 +25,7 @@ These apply to every task. Copy them into the task brief you hand an implementer
 - ZCode frames are `{ id, method, params? }` for requests, `{ id, result }` for responses, `{ id, error: { code, message, data? } }` for failures, and `{ eventId, sessionId, turnId?, seq, timestamp, type, payload? }` for events.
 - Every frame decoder is tolerant. Unknown fields are dropped, unknown event types are ignored, and a structurally broken frame is counted in the diagnostic rather than ending the connection.
 - ZCode delivers legacy events by cursor, not by push. Each session polls `session/events` with an `afterSeq` cursor.
+- ZCode asks the host for permission with a reverse request, `interaction/requestPermission`, and waits for that request's answer. The host answers requests as well as making them, and there is no `interaction/respond` method to call instead.
 - ZCode owns its own authentication. No test carries an auth check, an environment gate, or a conditional skip.
 - Tests use the two categories in `docs/testing.md` and nothing else: unit tests with injected ports, and real end-to-end tests. No `vi.mock`, no JSDOM, no component mounting.
 - Use the npm scripts for tooling. `npm run lint`, `npm run format:files -- <paths>`, `npm run typecheck`. Never call `oxlint`, `oxfmt` or `eslint` directly.
@@ -959,7 +960,26 @@ const responseFrameSchema = z
 
 export type ZCodeEventFrame = z.infer<typeof eventFrameSchema>;
 
+/**
+ * A request ZCode sends to the host. ZCode asks the host for permission with
+ * one, so the host has to answer it.
+ */
+const requestFrameSchema = z
+  .object({
+    id: z.union([z.string(), z.number()]),
+    method: z.string().min(1),
+    params: z.unknown().optional(),
+  })
+  .passthrough();
+
+export interface ZCodeRequestFrame {
+  id: string;
+  method: string;
+  params?: unknown;
+}
+
 export type ZCodeFrame =
+  | { kind: "request"; request: ZCodeRequestFrame }
   | { kind: "event"; event: ZCodeEventFrame }
   | { kind: "response"; id: string; result: unknown }
   | { kind: "error"; id: string; code: number; message: string; data?: unknown };
@@ -982,6 +1002,17 @@ export function decodeFrame(line: string): ZCodeFrame | undefined {
   } catch {
     return undefined;
   }
+  const request = requestFrameSchema.safeParse(parsed);
+  if (request.success) {
+    return {
+      kind: "request",
+      request: {
+        id: String(request.data.id),
+        method: request.data.method,
+        params: request.data.params,
+      },
+    };
+  }
   const event = eventFrameSchema.safeParse(parsed);
   if (event.success) return { kind: "event", event: event.data };
   const response = responseFrameSchema.safeParse(parsed);
@@ -1002,6 +1033,14 @@ export function encodeRequest(id: string, method: string, params?: unknown): str
   const frame: Record<string, unknown> = { id, method };
   if (params !== undefined) frame.params = params;
   return `${JSON.stringify(frame)}\n`;
+}
+
+export function encodeResponse(id: string, result: unknown): string {
+  return `${JSON.stringify({ id, result })}\n`;
+}
+
+export function encodeError(id: string, code: number, message: string): string {
+  return `${JSON.stringify({ id, error: { code, message } })}\n`;
 }
 ```
 
@@ -1144,6 +1183,9 @@ export class ZCodeRpcClient {
   private nextId = 1;
   private readonly pending = new Map<string, PendingCall>();
   private readonly listeners = new Set<(event: ZCodeEventFrame) => void>();
+  private readonly requestListeners = new Set<
+    (request: ZCodeRequestFrame) => Promise<unknown> | unknown
+  >();
   private closed = false;
 
   call(method: string, params?: unknown): Promise<unknown> {
@@ -1160,11 +1202,41 @@ export class ZCodeRpcClient {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * ZCode asks the host for permission with a reverse request, so the client
+   * has to answer requests as well as make them. The handler's resolved value
+   * is sent back as the response.
+   */
+  onRequest(listener: (request: ZCodeRequestFrame) => Promise<unknown> | unknown): () => void {
+    this.requestListeners.add(listener);
+    return () => this.requestListeners.delete(listener);
+  }
+
+  private async handleRequest(frame: ZCodeRequestFrame): Promise<void> {
+    for (const listener of this.requestListeners) {
+      try {
+        const result = await listener(frame);
+        this.write(encodeResponse(frame.id, result));
+        return;
+      } catch (error) {
+        this.write(
+          encodeError(frame.id, -32603, error instanceof Error ? error.message : String(error)),
+        );
+        return;
+      }
+    }
+    this.write(encodeError(frame.id, -32601, `Unknown method: ${frame.method}`));
+  }
+
   receive(line: string): void {
     const frame = decodeFrame(line);
     if (!frame) return;
     if (frame.kind === "event") {
       for (const listener of this.listeners) listener(frame.event);
+      return;
+    }
+    if (frame.kind === "request") {
+      void this.handleRequest(frame);
       return;
     }
     const pending = this.pending.get(frame.id);
@@ -1484,6 +1556,8 @@ Create `plugins/zcode-provider/server/internal/transport.ts`:
 ```ts
 import type { ZCodeConfigOption } from "./catalog.js";
 
+export type { ZCodeRequestFrame } from "./wire.js";
+
 export interface ZCodeWorkspaceRef {
   workspacePath: string;
   workspaceKey: string;
@@ -1510,6 +1584,11 @@ export interface ZCodeTransport {
   stop(input: { sessionId: string }): Promise<void>;
   /** Closes the ZCode session without ending the app-server process. */
   archive(input: { sessionId: string }): Promise<void>;
+  /**
+   * ZCode asks the host for permission with a reverse request and waits for
+   * the answer, so the host has to answer requests as well as make them.
+   */
+  onRequest(listener: (request: ZCodeRequestFrame) => Promise<unknown> | unknown): () => void;
   /**
    * Reads a session snapshot. ZCode returns its model, mode and thought-level
    * options on the snapshot, so the catalog is read through a session.
@@ -1541,6 +1620,7 @@ import { ZCODE_CAPABILITIES } from "../capabilities.js";
 import type { ZCodeProcess } from "./process.js";
 import type {
   ZCodeEvent,
+  ZCodeRequestFrame,
   ZCodeSessionHandle,
   ZCodeTransport,
   ZCodeWorkspaceRef,
@@ -2493,23 +2573,18 @@ export function permissionResponseFor(
 
 The raw ZCode options travel in `metadata`, which is a `Record<string, JsonValue>` on the request. That keeps the SDK type intact and means the selected action's own `response` reaches ZCode unchanged, including any `permissionUpdates` that make "always allow" stick.
 
-`answerPermission` is added to `ZCodeTransport` in this task:
+The permission is not answered with a separate RPC. ZCode asks the host with a reverse request, `interaction/requestPermission`, and waits for that request's own response (`apps/zcode-cli/packages/bootstrap/src/zcode-protocol/interaction-broker.ts:105-135` in the ZCode repository). There is no `interaction/respond` method in the legacy method table, so the answer travels back as the response to the reverse request.
+
+The transport therefore exposes the reverse request instead of an answering method:
 
 ```ts
 // In ZCodeTransport:
-answerPermission(input: { sessionId: string; requestId: string; response: unknown }): Promise<void>;
-```
+onRequest(listener: (request: ZCodeRequestFrame) => Promise<unknown> | unknown): () => void;
 
-And to the legacy transport:
-
-```ts
-async answerPermission(input) {
-  await process.rpc.call("interaction/respond", {
-    sessionId: input.sessionId,
-    requestId: input.requestId,
-    ...(input.response as Record<string, unknown>),
-  });
-}
+// In the legacy transport:
+onRequest(listener) {
+  return process.rpc.onRequest(listener);
+},
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
@@ -2664,6 +2739,20 @@ export function mapCatalog(configOptions: readonly ZCodeConfigOption[]): Provide
 
 Replace the stub `createConnection` in `plugins/zcode-provider/server/provider.ts` with this. It follows the `plugins/antigravity-provider/server/provider.ts` shape: a session map, a listener set, a serialized send queue, and a `dispatch` switch over `ProviderInput`.
 
+The connection needs these imports on top of the ones the stub already has:
+
+```ts
+import type {
+  ProviderCatalog,
+  ProviderConnection,
+  ProviderEvent,
+  ProviderLaunch,
+  ProviderPermissionRequest,
+} from "@getpaseo/plugin/server/provider";
+import { mapCatalog } from "./internal/catalog.js";
+import { mapPermissionRequest, permissionResponseFor } from "./internal/signals.js";
+```
+
 ```ts
 function createConnection(
   launch: ProviderLaunch,
@@ -2674,6 +2763,16 @@ function createConnection(
   let closed = false;
   let pending = Promise.resolve();
   let transport: ZCodeTransport | undefined;
+
+  /**
+   * ZCode asks the host for permission with a reverse request and waits for
+   * that request's answer. The answer has to come from the user, so the
+   * request is held here until the daemon sends the user's decision back.
+   */
+  const pendingPermissions = new Map<
+    string,
+    { request: ProviderPermissionRequest; resolve: (value: unknown) => void }
+  >();
 
   function emit(event: ProviderEvent): void {
     if (closed) return;
@@ -2705,6 +2804,23 @@ function createConnection(
       transport = createLegacyTransport(
         startZCodeProcess({ command: launch.command, args: launch.args, env: launch.env }),
       );
+      transport.onRequest(async (request) => {
+        if (request.method !== "interaction/requestPermission") {
+          throw new Error(`Unsupported ZCode request: ${request.method}`);
+        }
+        const params = (request.params ?? {}) as Record<string, unknown>;
+        const permission = mapPermissionRequest(params);
+        const nativeSessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+        const answer = new Promise<unknown>((resolve) => {
+          pendingPermissions.set(permission.id, { request: permission, resolve });
+        });
+        emit({
+          type: "session.permission",
+          sessionId: nativeIndex.get(nativeSessionId) ?? nativeSessionId,
+          request: permission,
+        });
+        return answer;
+      });
     }
     return transport;
   }
@@ -2771,7 +2887,15 @@ function createConnection(
         return;
       }
       case "session.permission": {
-        await session(input.sessionId).answerPermission(input.permissionId, input.response);
+        const pending = pendingPermissions.get(input.permissionId);
+        if (!pending) throw new ZCodeError(`Unknown permission request: ${input.permissionId}`);
+        pendingPermissions.delete(input.permissionId);
+        pending.resolve(permissionResponseFor(pending.request, input.response));
+        emit({
+          type: "session.permission_resolved",
+          sessionId: input.sessionId,
+          permissionId: input.permissionId,
+        });
         return;
       }
       case "session.archive": {
@@ -2908,19 +3032,6 @@ async configure(changes: ProviderConfigChanges): Promise<void> {
   }
 }
 
-async answerPermission(permissionId: string, response: ProviderPermissionResponse): Promise<void> {
-  const request = this.permissionRequests.get(permissionId);
-  if (!request) throw new ZCodeError(`Unknown permission request: ${permissionId}`);
-  const zcodeResponse = permissionResponseFor(request, response);
-  await this.options.transport.answerPermission({
-    sessionId: this.nativeSessionId,
-    requestId: permissionId,
-    response: zcodeResponse,
-  });
-  this.permissionRequests.delete(permissionId);
-  this.options.emit({ type: "session.permission_resolved", sessionId: this.options.id, permissionId });
-}
-
 async archive(): Promise<void> {
   await this.options.transport.archive({ sessionId: this.nativeSessionId });
 }
@@ -2928,16 +3039,7 @@ async archive(): Promise<void> {
 
 Archive and unarchive are not session-scoped operations. The daemon restores an archived agent by calling `unarchiveNativeSession` _before_ it opens the session, so no live `ZCodeSession` exists at that moment. The connection therefore drives the transport directly with the ZCode id carried by the persistence handle, and never looks up a live session for either case.
 
-`permissionRequests` is a `Map<string, ProviderPermissionRequest>` on the session. The session's event handler fills it when a `permission.requested` event arrives:
-
-```ts
-if (event.type === "permission.requested") {
-  const request = mapPermissionRequest(event.payload);
-  this.permissionRequests.set(request.id, request);
-  this.options.emit({ type: "session.permission", sessionId: this.options.id, request });
-  return;
-}
-```
+The permission round trip belongs to the connection, not to the session. ZCode asks the host with a reverse request and waits for that request's answer; the `permission.requested` session event is the record of the same thing, and answering it does not release ZCode. The session therefore does not handle `permission.requested` at all, and the connection owns the round trip.
 
 `archive` and `readSnapshot` are added to `ZCodeTransport` and to the legacy transport:
 
