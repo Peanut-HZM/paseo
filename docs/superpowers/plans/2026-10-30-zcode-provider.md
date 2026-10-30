@@ -1602,7 +1602,7 @@ Expected: FAIL with "Cannot find module './transport.js'".
 Create `plugins/zcode-provider/server/internal/transport.ts`:
 
 ```ts
-import type { ZCodeConfigOption } from "./catalog.js";
+import type { ZCodeSessionSettings } from "./catalog.js";
 
 export type { ZCodeRequestFrame } from "./wire.js";
 
@@ -1641,7 +1641,7 @@ export interface ZCodeTransport {
    * Reads a session snapshot. ZCode returns its model, mode and thought-level
    * options on the snapshot, so the catalog is read through a session.
    */
-  readSnapshot(input: { sessionId: string }): Promise<{ configOptions?: ZCodeConfigOption[] }>;
+  readSnapshot(input: { sessionId: string }): Promise<{ settings?: ZCodeSessionSettings }>;
   listSessions(input: { workspace?: ZCodeWorkspaceRef; limit?: number }): Promise<unknown[]>;
   setModel(input: { sessionId: string; model: string }): Promise<void>;
   setMode(input: { sessionId: string; mode: string }): Promise<void>;
@@ -1889,7 +1889,7 @@ This task owns the rule that a cancel which has not settled blocks new runs.
 
 - Consumes: `ZCodeTransport`, `ZCodeEvent` from Task 6.
 - Produces:
-  - `class ZCodeSession` with `open`, `prompt`, `interrupt`, `configure`, `close`, and an `onEvent` hook.
+  - `class ZCodeSession` with `open`, `prompt`, `interrupt`, `configure`, and `close`. It subscribes to the transport's events; it does not expose an `onEvent` hook of its own.
   - `type TurnPhase = "idle" | "running" | "stopping" | "settled"`.
 
 - [ ] **Step 1: Write the failing test**
@@ -2196,39 +2196,56 @@ export class ZCodeSession {
 
   interrupt(): Promise<void> {
     if (this.cancelInFlight) return this.cancelInFlight;
-    const cancelledTurnId = this.activeTurnId;
     this.phase = "stopping";
-    this.cancelInFlight = this.options.transport
-      .stop({ sessionId: this.nativeSessionId })
-      .then(() => {
-        this.cancelInFlight = undefined;
-        // The caller is owed a terminal. ZCode may or may not send one after
-        // a stop, so the provider emits the terminal itself and ignores the
-        // event that follows. The phase has to leave "stopping" too, or the
-        // session refuses every later prompt.
-        this.phase = "settled";
-        if (cancelledTurnId) {
-          this.options.emit({
-            type: "session.turn",
-            sessionId: this.options.id,
-            turnId: cancelledTurnId,
-            state: "canceled",
-          });
-        }
-      })
-      .catch((error) => {
-        this.cancelInFlight = undefined;
-        this.phase = "settled";
-        this.options.emit({
-          type: "session.turn",
-          sessionId: this.options.id,
-          turnId: cancelledTurnId ?? "zcode-turn-unknown",
-          state: "failed",
-          error: { message: error instanceof Error ? error.message : String(error) },
-        });
-        throw error;
-      });
+    this.cancelInFlight = this.settleCancel(this.cancelTarget());
     return this.cancelInFlight;
+  }
+
+  /**
+   * Runs the cancel and settles the turn it stopped. A cancel that lands leaves
+   * the session ready for the next run. A cancel that fails leaves the session
+   * in "stopping", because the turn may still be running in ZCode.
+   */
+  private async settleCancel(cancelledTurnId: string | undefined): Promise<void> {
+    try {
+      await this.options.transport.stop({ sessionId: this.nativeSessionId });
+    } catch (error) {
+      this.cancelInFlight = undefined;
+      // The failed terminal is the caller's answer for the turn, not the end
+      // of the stop: the session keeps refusing new runs until a stop lands.
+      this.options.emit({
+        type: "session.turn",
+        sessionId: this.options.id,
+        turnId: cancelledTurnId ?? "zcode-turn-unknown",
+        state: "failed",
+        error: { message: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
+    this.cancelInFlight = undefined;
+    // The caller is owed a terminal. ZCode may or may not send one after
+    // a stop, so the provider emits the terminal itself and ignores the
+    // event that follows. The phase has to leave "stopping" too, or the
+    // session refuses every later prompt.
+    this.phase = "settled";
+    if (cancelledTurnId) {
+      this.options.emit({
+        type: "session.turn",
+        sessionId: this.options.id,
+        turnId: cancelledTurnId,
+        state: "canceled",
+      });
+    }
+  }
+
+  /**
+   * The turn a cancel applies to. ZCode stops the session's current turn, so
+   * the turn that started natively wins. A turn that was dispatched but never
+   * acknowledged by ZCode is still owed a terminal, so the most recently
+   * dispatched turn is the fallback.
+   */
+  private cancelTarget(): string | undefined {
+    return this.activeTurnId ?? [...this.turns.values()].at(-1)?.turnId;
   }
 
   private handleEvent(event: ZCodeEvent): void {
@@ -2420,6 +2437,8 @@ describe("ZCode timeline mapping", () => {
   });
 });
 ```
+
+ZCode's legacy session snapshot carries the session's `settings`, and the catalog is read from them: the models come from `settings.model.available`, the thought levels from `settings.thoughtLevel.available`, and the current mode from `settings.mode.current`. The flat `configOptions` array is the v4 workspace-config projection of those same settings, and the legacy path never sends it.
 
 ZCode's `tool.updated` payload is a discriminated union on `kind`, not a payload with a `status` field (`packages/shared/src/zcode-protocol/index.ts:1682-1741` in the ZCode repository). The variants are `scheduled`, `started`, `progress`, `result`, `error`, `batch` and `raw`. Only `scheduled` carries the tool call's `input`, so the detail has to survive from that event to the later ones: the session keeps it per tool call id and passes it to the mapper.
 
@@ -2729,57 +2748,49 @@ git commit -m "feat(plugins): map ZCode events to timeline items and permissions
 
 - [ ] **Step 1: Write the failing catalog test**
 
-Create `plugins/zcode-provider/server/internal/catalog.test.ts`:
+Create `plugins/zcode-provider/server/internal/catalog.test.ts`. The mapper lives in the catalog module Task 6 created; this task adds the mapper function and its test.
 
 ```ts
 import { describe, expect, test } from "vitest";
 import { mapCatalog } from "./catalog.js";
 
 describe("ZCode catalog mapping", () => {
-  test("maps models, modes and thought levels from the config options", () => {
-    const catalog = mapCatalog([
-      {
-        id: "model",
-        name: "Model",
-        category: "model",
-        type: "select",
-        currentValue: "glm-5",
-        options: [
-          { value: "glm-5", name: "GLM 5" },
-          { value: "glm-4", name: "GLM 4" },
-        ],
+  test("maps models, modes and thought levels from the session settings", () => {
+    const catalog = mapCatalog({
+      settings: {
+        model: {
+          current: { providerId: "zai", modelId: "glm-5" },
+          available: [
+            { ref: { providerId: "zai", modelId: "glm-5" }, label: "GLM 5" },
+            { ref: { providerId: "zai", modelId: "glm-4" }, label: "GLM 4" },
+          ],
+        },
+        mode: { current: "plan" },
+        thoughtLevel: {
+          enabled: true,
+          current: "high",
+          available: [{ value: "high", label: "High" }],
+        },
       },
-      {
-        id: "mode",
-        name: "Mode",
-        category: "mode",
-        type: "select",
-        currentValue: "plan",
-        options: [
-          { value: "plan", name: "Plan" },
-          { value: "build", name: "Build" },
-        ],
-      },
-      {
-        id: "thought_level",
-        name: "Thought level",
-        category: "thought_level",
-        type: "select",
-        currentValue: "high",
-        options: [{ value: "high", name: "High" }],
-      },
-    ]);
-    expect(catalog.models.map((model) => model.id)).toEqual(["glm-5", "glm-4"]);
-    expect(catalog.modes.map((mode) => mode.id)).toEqual(["plan", "build"]);
+    });
+    expect(catalog.models.map((model) => model.id)).toEqual(["zai/glm-5", "zai/glm-4"]);
+    expect(catalog.modes.map((mode) => mode.id)).toEqual(["build", "guarded", "plan", "yolo"]);
     expect(catalog.thinkingOptions?.map((option) => option.id)).toEqual(["high"]);
-    expect(catalog.defaultModel).toBe("glm-5");
+    expect(catalog.defaultModel).toBe("zai/glm-5");
     expect(catalog.defaultMode).toBe("plan");
     expect(catalog.defaultThinkingOption).toBe("high");
   });
 
-  test("returns an empty catalog when there are no config options", () => {
-    expect(mapCatalog([]).models).toEqual([]);
-    expect(mapCatalog([]).modes).toEqual([]);
+  test("offers no thought levels when ZCode disabled them", () => {
+    const catalog = mapCatalog({
+      settings: { thoughtLevel: { enabled: false, available: [{ value: "high", label: "High" }] } },
+    });
+    expect(catalog.thinkingOptions).toEqual([]);
+  });
+
+  test("returns an empty catalog for a snapshot without settings", () => {
+    expect(mapCatalog({}).models).toEqual([]);
+    expect(mapCatalog({}).modes).toHaveLength(4);
   });
 });
 ```
@@ -2799,47 +2810,106 @@ Create `plugins/zcode-provider/server/internal/catalog.ts`:
 import type { ProviderCatalog } from "@getpaseo/plugin/server/provider";
 
 /**
- * ZCode's config options, as they arrive on a session snapshot
- * (`packages/shared/src/zcode-task-types-core.ts:392-402` in the ZCode
- * repository). The array is flat; `category` says what each option configures.
+ * ZCode's session settings, as they arrive on a session snapshot
+ * (`packages/shared/src/zcode-protocol/index.ts:1250-1281` in the ZCode
+ * repository). The legacy snapshot carries `settings`; the flat
+ * `configOptions` array is the v4 workspace-config projection of those same
+ * settings, and the app-server never sends it on this path.
  */
-export interface ZCodeConfigOption {
-  id: string;
-  name: string;
-  description?: string;
-  /** "mode" | "model" | "thought_level", or a custom category. */
-  category?: string;
-  type: "select" | "boolean";
-  currentValue: string | boolean;
-  options?: Array<{ value: string; name: string; description?: string }>;
+export interface ZCodeModelSelection {
+  providerId: string;
+  modelId: string;
 }
 
-export function mapCatalog(configOptions: readonly ZCodeConfigOption[]): ProviderCatalog {
-  const inCategory = (category: string) =>
-    configOptions.filter((option) => option.category === category);
+export interface ZCodeModelOption {
+  ref: ZCodeModelSelection;
+  label: string;
+  description?: string;
+}
 
-  const entries = (category: string) =>
-    inCategory(category).flatMap((option) =>
-      (option.options ?? []).map((entry) => ({
-        id: entry.value,
-        label: entry.name,
-        ...(option.description ? { description: option.description } : {}),
-      })),
-    );
+export interface ZCodeThoughtLevelOption {
+  value: string;
+  label: string;
+  description?: string;
+}
 
-  const current = (category: string) => {
-    const option = inCategory(category)[0];
-    return typeof option?.currentValue === "string" ? option.currentValue : undefined;
+export interface ZCodeSessionSettings {
+  model?: {
+    current?: ZCodeModelSelection;
+    available?: ZCodeModelOption[];
   };
+  thoughtLevel?: {
+    enabled?: boolean;
+    current?: string;
+    available?: ZCodeThoughtLevelOption[];
+  };
+  mode?: {
+    current?: string;
+  };
+}
 
-  const defaultModel = current("model");
-  const defaultMode = current("mode");
-  const defaultThinkingOption = current("thought_level");
+export interface ZCodeSnapshot {
+  settings?: ZCodeSessionSettings;
+}
+
+/**
+ * The modes ZCode offers, with the labels it uses
+ * (`packages/shared/src/zcode-agent-model-state.ts:19-40` in the ZCode
+ * repository). ZCode also accepts `edit`, which it keeps as a historical
+ * value but hides from the menu, so it is not offered here.
+ */
+export const ZCODE_MODES = [
+  { id: "build", label: "Ask before changes", description: "Ask before each file changes." },
+  { id: "guarded", label: "Autonomous mode", description: "Ask when there's risk" },
+  {
+    id: "plan",
+    label: "Plan mode",
+    description: "Inspect the code and present a plan before editing.",
+  },
+  {
+    id: "yolo",
+    label: "Full access",
+    description: "Edit and run commands with fewer confirmations.",
+  },
+] as const;
+
+/**
+ * The model id Paseo carries. ZCode's own picker value is
+ * "providerId/modelId" (`packages/shared/src/model-selection.ts:34-40` in the
+ * ZCode repository), and the transport turns it back into the pair that
+ * `session/setModel` wants.
+ */
+export function pickerValue(selection: ZCodeModelSelection): string {
+  return `${selection.providerId}/${selection.modelId}`;
+}
+
+export function mapCatalog(snapshot: ZCodeSnapshot): ProviderCatalog {
+  const settings = snapshot.settings;
+  const models = (settings?.model?.available ?? []).map((option) => ({
+    id: pickerValue(option.ref),
+    label: option.label,
+    ...(option.description ? { description: option.description } : {}),
+  }));
+  const thinkingOptions =
+    settings?.thoughtLevel?.enabled === false
+      ? []
+      : (settings?.thoughtLevel?.available ?? []).map((option) => ({
+          id: option.value,
+          label: option.label,
+          ...(option.description ? { description: option.description } : {}),
+        }));
+  const defaultModel = settings?.model?.current ? pickerValue(settings.model.current) : undefined;
+  const defaultMode = settings?.mode?.current;
+  const defaultThinkingOption = settings?.thoughtLevel?.current;
 
   return {
-    models: entries("model"),
-    modes: entries("mode"),
-    thinkingOptions: entries("thought_level"),
+    models,
+    modes: ZCODE_MODES.map((mode) => ({
+      id: mode.id,
+      label: mode.label,
+      description: mode.description,
+    })),
+    thinkingOptions,
     ...(defaultModel ? { defaultModel } : {}),
     ...(defaultMode ? { defaultMode } : {}),
     ...(defaultThinkingOption ? { defaultThinkingOption } : {}),
@@ -3174,7 +3244,7 @@ The permission round trip belongs to the connection, not to the session. ZCode a
 ```ts
 // In ZCodeTransport:
 archive(input: { sessionId: string }): Promise<void>;
-readSnapshot(input: { sessionId: string }): Promise<{ configOptions?: ZCodeConfigOption[] }>;
+readSnapshot(input: { sessionId: string }): Promise<{ settings?: ZCodeSessionSettings }>;
 
 // In the legacy transport:
 async archive(input) {
@@ -3183,8 +3253,8 @@ async archive(input) {
 async readSnapshot(input) {
   const snapshot = (await process.rpc.call("session/read", {
     sessionId: input.sessionId,
-  })) as { configOptions?: ZCodeConfigOption[] };
-  return { configOptions: snapshot?.configOptions ?? [] };
+  })) as { settings?: ZCodeSessionSettings };
+  return { settings: snapshot?.settings };
 },
 ```
 
@@ -3204,7 +3274,7 @@ async function readCatalog(cwd: string | undefined): Promise<ProviderCatalog> {
   });
   try {
     const snapshot = await ensureTransport().readSnapshot({ sessionId: handle.sessionId });
-    return mapCatalog(snapshot.configOptions ?? []);
+    return mapCatalog(snapshot);
   } finally {
     await ensureTransport().archive({ sessionId: handle.sessionId });
   }
