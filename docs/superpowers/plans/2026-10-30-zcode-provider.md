@@ -3102,7 +3102,7 @@ case "catalog": {
 }
 ```
 
-`toSessionSummary` converts a ZCode session entry into a `ProviderSessionSummary`, which is `{ persistence, cwd, title?, description?, updatedAt? }`:
+`toSessionSummary` converts a ZCode session entry into a `ProviderSessionSummary`, which is `{ persistence, cwd, title?, description?, updatedAt? }`. ZCode's session info nests the workspace as `{ workspacePath, workspaceKey }` and reports `updatedAt` as a millisecond number (`packages/shared/src/zcode-protocol-legacy-types.ts:148-164` in the ZCode repository), so the summary has to read the nested path and render the timestamp as a string:
 
 ```ts
 function nativeSessionIdOf(persistence: ProviderPersistence): string {
@@ -3114,20 +3114,22 @@ function nativeSessionIdOf(persistence: ProviderPersistence): string {
 }
 
 function toSessionSummary(entry: unknown): ProviderSessionSummary {
+  // ZCode's session info nests the workspace and reports the update time as
+  // a millisecond timestamp, while Paseo's summary wants a path and a string.
   const record = entry as {
     sessionId?: string;
     title?: string;
-    workspacePath?: string;
-    updatedAt?: string;
+    workspace?: { workspacePath?: string; workspaceKey?: string };
+    updatedAt?: number;
   };
   return {
     persistence: {
       version: 1,
       data: { nativeSessionId: record.sessionId ?? "" },
     },
-    cwd: record.workspacePath ?? "",
+    cwd: record.workspace?.workspacePath ?? "",
     ...(record.title ? { title: record.title } : {}),
-    ...(record.updatedAt ? { updatedAt: record.updatedAt } : {}),
+    ...(record.updatedAt ? { updatedAt: new Date(record.updatedAt).toISOString() } : {}),
   };
 }
 ```
