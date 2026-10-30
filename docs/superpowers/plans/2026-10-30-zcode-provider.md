@@ -1336,8 +1336,44 @@ for await (const line of lines) {
     continue;
   }
   if (request.method === "session/send") {
+    if (mode !== "permission") {
+      pushTurn(request.params.sessionId, request.params.inputId, request.params.content);
+      process.stdout.write(
+        `${JSON.stringify({ id, result: { sessionId: request.params.sessionId, accepted: true, stateRevision: 1 } })}\n`,
+      );
+      continue;
+    }
+    // ZCode asks the host for permission with a reverse request and waits
+    // for that request's answer before the turn runs.
+    pendingTurn = {
+      requestId: id,
+      sessionId: request.params.sessionId,
+      inputId: request.params.inputId,
+      content: request.params.content,
+    };
     process.stdout.write(
-      `${JSON.stringify({ id, result: { sessionId: request.params.sessionId, accepted: true, stateRevision: 1 } })}\n`,
+      `${JSON.stringify({
+        id: "perm-1",
+        method: "interaction/requestPermission",
+        params: {
+          requestId: "perm-1",
+          sessionId: request.params.sessionId,
+          toolCallId: "t1",
+          toolName: "bash",
+          reason: "run a command",
+          riskLevel: "low",
+          input: { command: "ls" },
+          options: [
+            {
+              optionId: "allow",
+              kind: "allow_always",
+              name: "Allow",
+              response: { decision: "allow" },
+            },
+            { optionId: "deny", kind: "deny", name: "Deny", response: { decision: "deny" } },
+          ],
+        },
+      })}\n`,
     );
     continue;
   }
@@ -1863,12 +1899,7 @@ Create `plugins/zcode-provider/server/internal/session.test.ts`:
 ```ts
 import { describe, expect, test, vi } from "vitest";
 import { ZCodeSession } from "./session.js";
-import type {
-  ProviderEvent,
-  ProviderPrompt,
-  ProviderToolCallDetail,
-} from "@getpaseo/plugin/server/provider";
-import { toolDetailFor } from "./timeline.js";
+import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/provider";
 import type { ZCodeEvent, ZCodeTransport } from "./transport.js";
 
 /**
@@ -2086,8 +2117,7 @@ export class ZCodeSession {
   private readonly nativeTurnIds = new Map<string, string>();
   /** The most recently started turn, used when an event carries no usable id. */
   private activeTurnId: string | undefined;
-  /** The detail of each tool call, keyed by tool call id. */
-  private readonly toolDetails = new Map<string, ProviderToolCallDetail>();
+
   private nativeSessionId = "";
   private cancelInFlight: Promise<void> | undefined;
   private readonly unsubscribe: () => void;
@@ -2565,6 +2595,21 @@ export function toolDetailFor(input: unknown): ProviderToolCallDetail {
   if (typeof query === "string") return { type: "search", query };
   return { type: "shell", command: "" };
 }
+```
+
+The session gains the tool-detail map and the import, because the timeline mapper lives in this task:
+
+```ts
+// In ZCodeSession, in plugins/zcode-provider/server/internal/session.ts:
+import type {
+  ProviderEvent,
+  ProviderPrompt,
+  ProviderToolCallDetail,
+} from "@getpaseo/plugin/server/provider";
+import { toolDetailFor } from "./timeline.js";
+
+/** The detail of each tool call, keyed by tool call id. */
+private readonly toolDetails = new Map<string, ProviderToolCallDetail>();
 ```
 
 - [ ] **Step 4: Write the permission mapper**
@@ -3333,7 +3378,7 @@ describe("ZCode provider", () => {
       launch: {
         command: process.execPath,
         args: [fakeServer],
-        env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
+        env: { ...process.env, FAKE_ZCODE_MODE: "permission" },
       },
       versions: [1],
       capabilities: ["prompt.message", "permission"],
@@ -3424,6 +3469,8 @@ git commit -m "feat(plugins): wire the ZCode provider connection"
 
 Replace `plugins/zcode-provider/test/fake-zcode-app-server.mjs` with a version that scripts a full turn. `session/create` returns a session id, `session/send` queues three events, and `session/events` returns the queued events the client has not seen yet, advancing by `seq`.
 
+Two modes, chosen with `FAKE_ZCODE_MODE`: `ok` runs the turn straight, and `permission` asks the host for permission first. The loop must not wait inside it — the answer to the fake's own reverse request arrives as a later line, and a loop that awaited would never read it. The fake therefore remembers the pending turn and finishes it when the answer comes.
+
 ```js
 import { createInterface } from "node:readline";
 
@@ -3431,6 +3478,8 @@ const lines = createInterface({ input: process.stdin });
 const mode = process.env.FAKE_ZCODE_MODE ?? "ok";
 const queue = [];
 let seq = 0;
+/** The turn waiting on the host's answer to the fake's permission request. */
+let pendingTurn = null;
 
 function push(sessionId, type, payload, extra = {}) {
   seq += 1;
@@ -3445,10 +3494,41 @@ function push(sessionId, type, payload, extra = {}) {
   });
 }
 
+function pushTurn(sessionId, inputId, content) {
+  const turnId = "turn-1";
+  push(sessionId, "turn.started", { turnNumber: 1, input: content, inputId }, { turnId });
+  push(
+    sessionId,
+    "message.upserted",
+    { messageId: "m1", role: "assistant", content: "hello from zcode" },
+    { turnId },
+  );
+  push(
+    sessionId,
+    "turn.completed",
+    { response: "hello from zcode", tokenCount: 12, toolCallCount: 0, duration: 5 },
+    { turnId },
+  );
+}
+
 for await (const line of lines) {
   if (!line.trim()) continue;
   const request = JSON.parse(line);
   const id = request.id;
+
+  // The host's answer to the reverse request the fake sent. It arrives as a
+  // frame with the fake's own id, and it is not a request from the host.
+  if (id === "perm-1") {
+    const turn = pendingTurn;
+    pendingTurn = null;
+    if (turn) {
+      pushTurn(turn.sessionId, turn.inputId, turn.content);
+      process.stdout.write(
+        `${JSON.stringify({ id: turn.requestId, result: { sessionId: turn.sessionId, accepted: true, stateRevision: 1 } })}\n`,
+      );
+    }
+    continue;
+  }
 
   if (mode === "exit") {
     process.exit(3);
