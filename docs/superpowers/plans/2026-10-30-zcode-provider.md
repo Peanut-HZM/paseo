@@ -2916,6 +2916,10 @@ function createConnection(
         return;
       }
       case "session.can_stop_runtime": {
+        // The daemon already refuses the probe while a turn is active or a
+        // prompt is pending. The legacy transport has no background work of
+        // its own: it runs no subagents and no background commands, so
+        // releasing the runtime loses nothing.
         emit({
           type: "session.can_stop_runtime",
           requestId: input.requestId,
