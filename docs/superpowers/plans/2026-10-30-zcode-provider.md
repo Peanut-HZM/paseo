@@ -2737,7 +2737,7 @@ git commit -m "feat(plugins): map ZCode events to timeline items and permissions
 **Files:**
 
 - Modify: `plugins/zcode-provider/server/provider.ts` — replace the stub with a real connection
-- Create: `plugins/zcode-provider/server/internal/catalog.ts`
+- Modify: `plugins/zcode-provider/server/internal/catalog.ts`
 - Test: `plugins/zcode-provider/server/internal/catalog.test.ts`
 - Test: `plugins/zcode-provider/server/provider.test.ts`
 
@@ -2804,7 +2804,7 @@ Expected: FAIL with "Cannot find module './catalog.js'".
 
 - [ ] **Step 3: Write the catalog mapper**
 
-Create `plugins/zcode-provider/server/internal/catalog.ts`:
+Add the mapper to `plugins/zcode-provider/server/internal/catalog.ts`, the module Task 6 created for the snapshot's settings types:
 
 ```ts
 import type { ProviderCatalog } from "@getpaseo/plugin/server/provider";
