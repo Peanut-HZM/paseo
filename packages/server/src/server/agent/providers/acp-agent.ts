@@ -153,6 +153,26 @@ function rejectOnSpawnError(child: ChildProcess, stderrChunks: string[]): Promis
   });
 }
 
+// An ACP agent that exits during the handshake (a broken npx command, a stale
+// wrapper, an auth failure) never rejects the SDK's initialize request. Without
+// this promise the provider refresh waits out its full deadline and reports a
+// misleading timeout instead of the child's stderr.
+function rejectOnEarlyExit(child: ChildProcess, stderrChunks: string[]): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    child.once("close", (code, signal) => {
+      const stderr = stderrChunks.join("").trim();
+      const status = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+      reject(
+        new Error(
+          `ACP agent process exited before initialization completed (${status})${
+            stderr ? `\n${stderr}` : ""
+          }`,
+        ),
+      );
+    });
+  });
+}
+
 async function isDirectory(target: string): Promise<boolean> {
   try {
     return (await fs.stat(target)).isDirectory();
@@ -543,6 +563,7 @@ interface ACPProcessTransport {
   stderrChunks: string[];
   spawnReady: Promise<void>;
   spawnError: Promise<never>;
+  exitError: Promise<never>;
 }
 
 interface ACPImportPromptPreviews {
@@ -1426,6 +1447,7 @@ export class ACPAgentClient implements AgentClient {
     });
 
     const spawnErrorPromise = rejectOnSpawnError(child, stderrChunks);
+    const exitErrorPromise = rejectOnEarlyExit(child, stderrChunks);
     const spawnReadyPromise = new Promise<void>((resolve) => {
       child.once("spawn", () => {
         resolve();
@@ -1445,6 +1467,7 @@ export class ACPAgentClient implements AgentClient {
       stderrChunks,
       spawnReady: spawnReadyPromise,
       spawnError: spawnErrorPromise,
+      exitError: exitErrorPromise,
     };
   }
 
@@ -1475,6 +1498,7 @@ export class ACPAgentClient implements AgentClient {
             clientInfo: { name: "Paseo", version: "dev" },
           }),
           transport.spawnError,
+          transport.exitError,
           ...(initializeTimeoutPromise ? [initializeTimeoutPromise] : []),
         ]),
       );
@@ -1666,7 +1690,10 @@ export class ACPAgentClient implements AgentClient {
       throw new Error(`${this.provider} command '${this.defaultCommand[0]}' not found`);
     }
     return {
-      command: prefix.command,
+      // Use the path the resolver actually verified. PATH lookup may find a
+      // Windows install outside the daemon's inherited PATH (for example a
+      // Winget package or a directory added after the daemon started).
+      command: availability.resolvedPath ?? prefix.command,
       args: [...prefix.args, ...this.defaultCommand.slice(1)],
     };
   }
