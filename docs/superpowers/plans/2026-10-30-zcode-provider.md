@@ -2117,6 +2117,8 @@ export class ZCodeSession {
   private readonly nativeTurnIds = new Map<string, string>();
   /** The most recently started turn, used when an event carries no usable id. */
   private activeTurnId: string | undefined;
+  /** The Paseo turn ids that already have a terminal. */
+  private readonly terminalTurns = new Set<string>();
 
   private nativeSessionId = "";
   private cancelInFlight: Promise<void> | undefined;
@@ -2229,6 +2231,14 @@ export class ZCodeSession {
     // session refuses every later prompt.
     this.phase = "settled";
     if (cancelledTurnId) {
+      // The turn is terminal. Remember that, so a terminal that ZCode sends
+      // for it afterwards cannot flip it back to completed, and drop it from
+      // the live turns so a later terminal cannot be attributed to it.
+      this.terminalTurns.add(cancelledTurnId);
+      for (const [key, value] of this.turns) {
+        if (value.turnId === cancelledTurnId) this.turns.delete(key);
+      }
+      if (this.activeTurnId === cancelledTurnId) this.activeTurnId = undefined;
       this.options.emit({
         type: "session.turn",
         sessionId: this.options.id,
@@ -2265,14 +2275,15 @@ export class ZCodeSession {
       return;
     }
     if (event.type === "turn.completed" || event.type === "turn.failed") {
-      // A stopped turn already has its terminal: the provider emitted
-      // "canceled" when the cancel settled.
-      if (this.phase === "stopping" || this.phase === "settled") return;
-      const turnId =
-        (event.turnId ? this.nativeTurnIds.get(event.turnId) : undefined) ??
-        this.activeTurnId ??
-        [...this.turns.values()].at(-1)?.turnId;
+      // A turn ZCode names has to be one this session started. An event whose
+      // turn id the session never mapped belongs to a turn it did not run.
+      // A terminal that arrives after a cancel is one the session already gave
+      // a terminal for, and a second terminal for a finished turn would flip
+      // it from cancelled to completed.
+      const turnId = event.turnId ? this.nativeTurnIds.get(event.turnId) : this.activeTurnId;
       if (!turnId) return;
+      if (this.terminalTurns.has(turnId)) return;
+      this.terminalTurns.add(turnId);
       if (event.turnId) this.nativeTurnIds.delete(event.turnId);
       for (const [key, value] of this.turns) {
         if (value.turnId === turnId) this.turns.delete(key);
