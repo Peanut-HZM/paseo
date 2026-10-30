@@ -1985,6 +1985,23 @@ describe("ZCode session turn state", () => {
     await expect(session.prompt(textPrompt("m2", "again"))).rejects.toThrow(/cancel/i);
   });
 
+  test("a stopped turn reaches a terminal and the session accepts a new prompt", async () => {
+    const harness = fakeTransport();
+    const events: ProviderEvent[] = [];
+    const session = new ZCodeSession({
+      id: "paseo-1",
+      transport: harness.transport,
+      emit: (event) => events.push(event),
+    });
+    await session.open({ cwd: "/w" });
+    await session.prompt(textPrompt("m1", "hello"));
+    await session.interrupt();
+    const turns = events.filter((event) => event.type === "session.turn");
+    expect(turns.some((event) => event.state === "canceled")).toBe(true);
+    // The session must leave the stopping phase, or it refuses every later run.
+    await expect(session.prompt(textPrompt("m2", "again"))).resolves.toBeUndefined();
+  });
+
   test("attributes each turn's completion to the turn that started it", async () => {
     const harness = fakeTransport();
     const events: ProviderEvent[] = [];
