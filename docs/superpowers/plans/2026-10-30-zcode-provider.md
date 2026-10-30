@@ -17,7 +17,7 @@ These apply to every task. Copy them into the task brief you hand an implementer
 - The ZCode repository at `/Users/huazhongmin/IdeaProjects/ZCode` is read-only for this work. Nothing in this plan edits it.
 - The provider ships as a bundled plugin under `plugins/zcode-provider/`. Paseo core gains no provider manifest entry, no provider factory, and no protocol-layer provider id.
 - Provider protocol version stays `1`. `PROVIDER_PROTOCOL_VERSION` in `packages/plugin/src/server/provider.ts` is not changed.
-- `paseo-plugin.json` reads exactly `{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.1-beta.1" } }`. The floor is the release that carries the Task 1 launch-resolution fix. `v0.14.0-beta.2` and `v0.14.0` are already published and both predate that fix, so a floor of `>=0.14.0-beta.2` would admit a daemon that ignores `resolveCommand` entirely and can never find the binary. The floor is load-bearing: `assertPluginCompatibility` runs inside `compileDirectoryPlugin`, which every start path goes through — `PluginService.start` for configured plugins and `PluginService.startBuiltinPlugin` for bundled ones — so an incompatible daemon refuses the plugin with a readable message instead of failing later on a strict metadata schema. Task 1 lands before the plugin work starts; confirm the floor against the release that actually carries it before the plugin ships. A checkout whose `package.json` version is below the floor will refuse to load the plugin, so the version has to reach the floor before the provider appears in a local daemon.
+- `paseo-plugin.json` reads exactly `{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.1-beta.1" } }`. The floor is the release that carries the Task 1 launch-resolution fix. `v0.14.0-beta.2` and `v0.14.0` are already published and both predate that fix, so a floor of `>=0.14.0-beta.2` would admit a daemon that ignores `resolveCommand` entirely and can never find the binary. The floor is load-bearing: `assertPluginCompatibility` runs inside `compileDirectoryPlugin`, which every start path goes through — `PluginService.start` for configured plugins and `PluginService.startBuiltinPlugin` for bundled ones — so an incompatible daemon refuses the plugin with a readable message instead of failing later on a strict metadata schema. Task 1 lands before the plugin work starts; confirm the floor against the release that actually carries it before the plugin ships. The branch has to sit on that release line: `scripts/builtin-plugins-dist.test.mjs` loads every listed built-in plugin with the server's own version, so a checkout whose `package.json` version is below the floor fails that test. The branch therefore carries `0.14.1-beta.1`, which the floor admits, while `0.14.0` and `0.14.0-beta.2` are rejected.
 - The legacy transport declares exactly these capabilities: `prompt.message`, `permission`, `permission.tool_policy`, `session.configure`, `session.list`, `session.persistence`, `session.archive`, `session.unarchive`, `session.can_stop_runtime`, `session.subsession`, `timeline.plugin`. It does not declare `session.revert.conversation`, `session.revert.files`, `session.revert.both`, `prompt.steer`, or `prompt.output_schema`.
 - The legacy transport does not declare `prompt.command` or `prompt.image` yet, even though the design's capability matrix lists both for the legacy transport. A declared capability is a promise the daemon trusts: the daemon routes a command or image prompt to the provider and rejects it only if the capability is absent. Declaring one the transport cannot honour turns a clean rejection into a runtime failure, and dropping an image silently loses the user's content. The legacy transport's `send` carries text only, and the plan has no grounded description of the ZCode attachment or slash-command wire format. Slash commands come from `available_commands_update` and land with the parity work the design schedules as P2. Both capabilities return with that work; until then the session rejects a command or a non-text part outright rather than pretending to handle it.
 - Binary resolution order, first match wins: the user's `agents.providers.zcode.command` override, then `zcode` on PATH, then the runtime bundled in the ZCode desktop app under `resources/glm/`, then the `GLM_BINARY_PATH` environment variable.
@@ -499,7 +499,7 @@ This commit is its own pull request. It merges before the plugin work starts, so
 Create `plugins/zcode-provider/server/internal/binary.test.ts`:
 
 ```ts
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -539,6 +539,8 @@ describe("ZCode binary discovery", () => {
     const root = await mkdtemp(join(tmpdir(), "zcode-bin-"));
     const binary = join(root, "zcode");
     await writeFile(binary, "#!/bin/sh\n");
+    // The discovery checks the executable bit, so the fixture needs it.
+    await chmod(binary, 0o755);
     const result = await resolveZCodeCommand({
       pathEntries: [root],
       env: {},
