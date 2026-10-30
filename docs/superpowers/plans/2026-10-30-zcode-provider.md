@@ -1757,7 +1757,12 @@ Create `plugins/zcode-provider/server/internal/session.test.ts`:
 ```ts
 import { describe, expect, test, vi } from "vitest";
 import { ZCodeSession } from "./session.js";
-import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/provider";
+import type {
+  ProviderEvent,
+  ProviderPrompt,
+  ProviderToolCallDetail,
+} from "@getpaseo/plugin/server/provider";
+import { toolDetailFor } from "./timeline.js";
 import type { ZCodeEvent, ZCodeTransport } from "./transport.js";
 
 /**
@@ -1958,6 +1963,8 @@ export class ZCodeSession {
   private readonly nativeTurnIds = new Map<string, string>();
   /** The most recently started turn, used when an event carries no usable id. */
   private activeTurnId: string | undefined;
+  /** The detail of each tool call, keyed by tool call id. */
+  private readonly toolDetails = new Map<string, ProviderToolCallDetail>();
   private nativeSessionId = "";
   private cancelInFlight: Promise<void> | undefined;
   private readonly unsubscribe: () => void;
@@ -2147,11 +2154,9 @@ describe("ZCode timeline mapping", () => {
       type: "message.upserted",
       sessionId: "s1",
       seq: 1,
-      payload: { messageId: "m1", content: "hello", role: "assistant" },
+      payload: { content: "hello" },
     });
-    expect(items).toEqual([
-      { id: "m1", type: "assistant_message", text: "hello", messageId: "m1" },
-    ]);
+    expect(items).toEqual([{ id: "s1-1", type: "assistant_message", text: "hello" }]);
   });
 
   test("maps a reasoning delta", () => {
@@ -2164,18 +2169,43 @@ describe("ZCode timeline mapping", () => {
     expect(items[0]).toMatchObject({ type: "reasoning", text: "thinking" });
   });
 
-  test("maps a tool call", () => {
+  test("maps a scheduled tool call", () => {
     const items = mapEventToTimelineItems({
       type: "tool.updated",
       sessionId: "s1",
       seq: 3,
-      payload: { toolCallId: "t1", toolName: "read_file", kind: "read", input: { path: "/a" } },
+      payload: {
+        toolCallId: "t1",
+        toolName: "read_file",
+        kind: "scheduled",
+        input: { path: "/a" },
+      },
     });
     expect(items[0]).toMatchObject({
       type: "tool_call",
       callId: "t1",
       name: "read_file",
       status: "running",
+      error: null,
+      detail: { type: "read", filePath: "/a" },
+    });
+  });
+
+  test("maps a completed tool call and keeps the detail from the scheduled event", () => {
+    const toolDetails = new Map([["t1", { type: "read", filePath: "/a" } as const]]);
+    const items = mapEventToTimelineItems(
+      {
+        type: "tool.updated",
+        sessionId: "s1",
+        seq: 4,
+        payload: { toolCallId: "t1", toolName: "read_file", kind: "result" },
+      },
+      { toolDetails },
+    );
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      callId: "t1",
+      status: "completed",
       error: null,
       detail: { type: "read", filePath: "/a" },
     });
@@ -2189,15 +2219,15 @@ describe("ZCode timeline mapping", () => {
       payload: {
         toolCallId: "t2",
         toolName: "bash",
-        status: "failed",
-        input: { command: "ls" },
+        kind: "error",
+        error: { message: "boom" },
       },
     });
     expect(items[0]).toMatchObject({
       type: "tool_call",
       callId: "t2",
       status: "failed",
-      detail: { type: "shell", command: "ls" },
+      error: { message: "boom" },
     });
   });
 
@@ -2213,6 +2243,10 @@ describe("ZCode timeline mapping", () => {
   });
 });
 ```
+
+ZCode's `tool.updated` payload is a discriminated union on `kind`, not a payload with a `status` field (`packages/shared/src/zcode-protocol/index.ts:1682-1741` in the ZCode repository). The variants are `scheduled`, `started`, `progress`, `result`, `error`, `batch` and `raw`. Only `scheduled` carries the tool call's `input`, so the detail has to survive from that event to the later ones: the session keeps it per tool call id and passes it to the mapper.
+
+ZCode's `message.upserted` payload carries the content and nothing else (`packages/shared/src/zcode-protocol/index.ts:1631-1639`): no message id and no role. The timeline id comes from the event, and a user message cannot be told apart from an assistant one there.
 
 Create `plugins/zcode-provider/server/internal/signals.test.ts`:
 
@@ -2304,31 +2338,33 @@ interface EventPayload {
   field?: string;
   delta?: string;
   content?: string;
-  role?: string;
   toolCallId?: string;
   toolName?: string;
   kind?: string;
   input?: unknown;
-  status?: string;
+  error?: { message?: string };
 }
 
-export function mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem[] {
+export interface TimelineMappingOptions {
+  /**
+   * The detail of each tool call, keyed by tool call id. ZCode carries a
+   * tool call's input only on the `scheduled` variant, so the detail has to
+   * survive from that event to the `result` and `error` variants.
+   */
+  toolDetails?: ReadonlyMap<string, ProviderToolCallDetail>;
+}
+
+export function mapEventToTimelineItems(
+  event: ZCodeEvent,
+  options: TimelineMappingOptions = {},
+): ProviderTimelineItem[] {
   const payload = (event.payload ?? {}) as EventPayload;
   if (event.type === "message.upserted") {
-    const id = payload.messageId ?? `${event.sessionId}-${event.seq}`;
-    if (payload.role === "user") {
-      return [
-        { id, type: "user_message", text: payload.content ?? "", messageId: payload.messageId },
-      ];
-    }
-    return [
-      {
-        id,
-        type: "assistant_message",
-        text: payload.content ?? "",
-        messageId: payload.messageId,
-      },
-    ];
+    // ZCode's message payload carries the content and nothing else: no
+    // message id and no role. The id comes from the event, and a user
+    // message cannot be told apart from an assistant one here.
+    const id = `${event.sessionId}-${event.seq}`;
+    return [{ id, type: "assistant_message", text: payload.content ?? "" }];
   }
   if (event.type === "part.delta") {
     const id = payload.partId ?? payload.messageId ?? `${event.sessionId}-${event.seq}`;
@@ -2339,11 +2375,16 @@ export function mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem
   if (event.type === "tool.updated") {
     const callId = payload.toolCallId ?? `${event.sessionId}-${event.seq}`;
     const name = payload.toolName ?? "tool";
-    const detail = toolDetailFor(payload.input);
+    const detail = options.toolDetails?.get(callId) ??
+      (payload.kind === "scheduled" ? toolDetailFor(payload.input) : undefined) ?? {
+        type: "plain_text",
+        label: name,
+        text: "",
+      };
     // A tool call is a discriminated union: `error` is null for every status
     // except `failed`. Compute the status and the error together, or the
     // object literal satisfies neither branch.
-    if (payload.status === "failed") {
+    if (payload.kind === "error") {
       return [
         {
           id: callId,
@@ -2351,17 +2392,12 @@ export function mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem
           callId,
           name,
           status: "failed",
-          error: { message: "tool failed" },
+          error: { message: payload.error?.message ?? "tool failed" },
           detail,
         },
       ];
     }
-    const status =
-      payload.status === "canceled" || payload.status === "cancelled"
-        ? "canceled"
-        : payload.status === "completed" || payload.status === "success"
-          ? "completed"
-          : "running";
+    const status = payload.kind === "result" ? "completed" : "running";
     return [{ id: callId, type: "tool_call", callId, name, status, error: null, detail }];
   }
   return [];
@@ -2372,7 +2408,7 @@ export function mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem
  * detail variant that matches the input, so the client renders a file read
  * as a file read instead of a shell command.
  */
-function toolDetailFor(input: unknown): ProviderToolCallDetail {
+export function toolDetailFor(input: unknown): ProviderToolCallDetail {
   const record = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
   const command = record.command;
   if (typeof command === "string") return { type: "shell", command };
@@ -2407,7 +2443,7 @@ const ZCODE_OPTIONS_METADATA_KEY = "zcodePermissionOptions";
 
 export function mapPermissionRequest(payload: unknown): ProviderPermissionRequest {
   const request = payload as {
-    requestId: string;
+    requestId?: string;
     sessionId: string;
     toolCallId: string;
     toolName: string;
@@ -2417,7 +2453,9 @@ export function mapPermissionRequest(payload: unknown): ProviderPermissionReques
     options: ZCodePermissionOption[];
   };
   return {
-    id: request.requestId,
+    // ZCode's permission request carries an optional request id. The tool
+    // call id is always there and identifies the request just as well.
+    id: request.requestId ?? request.toolCallId,
     name: request.toolName,
     kind: "tool",
     title: request.toolName,
@@ -3298,7 +3336,18 @@ if (
   event.type !== "turn.completed" &&
   event.type !== "turn.failed"
 ) {
-  for (const item of mapEventToTimelineItems(event)) {
+  if (event.type === "tool.updated") {
+    const payload = event.payload as
+      | { kind?: string; toolCallId?: string; input?: unknown }
+      | undefined;
+    // Only the scheduled variant carries the tool call's input. Remember it,
+    // because the later result and error variants describe the same call and
+    // the timeline item has to keep its detail.
+    if (payload?.kind === "scheduled" && payload.toolCallId) {
+      this.toolDetails.set(payload.toolCallId, toolDetailFor(payload.input));
+    }
+  }
+  for (const item of mapEventToTimelineItems(event, { toolDetails: this.toolDetails })) {
     this.options.emit({ type: "timeline.item", sessionId: this.options.id, item });
   }
 }
