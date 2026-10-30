@@ -1166,7 +1166,14 @@ Expected: FAIL with "Cannot find module './rpc.js'".
 Create `plugins/zcode-provider/server/internal/rpc.ts`:
 
 ```ts
-import { decodeFrame, encodeRequest, type ZCodeEventFrame } from "./wire.js";
+import {
+  decodeFrame,
+  encodeError,
+  encodeRequest,
+  encodeResponse,
+  type ZCodeEventFrame,
+  type ZCodeRequestFrame,
+} from "./wire.js";
 
 interface PendingCall {
   resolve(value: unknown): void;
@@ -1241,7 +1248,7 @@ export class ZCodeRpcClient {
       return;
     }
     if (frame.kind === "request") {
-      void this.handleRequest(frame);
+      void this.handleRequest(frame.request);
       return;
     }
     const pending = this.pending.get(frame.id);
