@@ -6,13 +6,13 @@ Scope: Add a ZCode provider to Paseo as a bundled plugin. The ZCode repository i
 
 ## Decision summary
 
-| Question                                                                     | Decision                                                                                                                    |
-| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Where does the adapter live?                                                 | A bundled plugin under `plugins/zcode-provider/`. Paseo core gains no provider entry, no factory, no manifest id.           |
-| Which ZCode protocol surface?                                                | Two transports behind one interface. Legacy `session/*` first, V4 `v4/*` second.                                            |
-| How does the provider find the ZCode binary?                                 | A user override first, then `zcode` on PATH, then the runtime bundled inside the ZCode desktop app, then `GLM_BINARY_PATH`. |
-| Does the change touch Paseo core?                                            | One small general fix in `plugin-provider.ts` so a plugin can own binary discovery. It lands as its own PR.                 |
-| Is the goal "Paseo can drive ZCode" or "ZCode becomes a standard ACP agent"? | The first. ZCode exporting ACP is a separate product decision and is out of scope here.                                     |
+| Question                                                                     | Decision                                                                                                                                                                        |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where does the adapter live?                                                 | A bundled plugin under `plugins/zcode-provider/`. Paseo core gains no provider entry, no factory, no manifest id.                                                               |
+| Which ZCode protocol surface?                                                | Two transports behind one interface. Legacy `session/*` first, V4 `v4/*` second.                                                                                                |
+| How does the provider find the ZCode binary?                                 | A user override first, then `zcode` on PATH, then the runtime bundled inside the ZCode desktop app, then `GLM_BINARY_PATH`.                                                     |
+| Does the change touch Paseo core?                                            | One small general fix: an optional `resolveCommand` hook on the plugin SDK, and launch resolution that honors a user override before asking the plugin. It lands as its own PR. |
+| Is the goal "Paseo can drive ZCode" or "ZCode becomes a standard ACP agent"? | The first. ZCode exporting ACP is a separate product decision and is out of scope here.                                                                                         |
 
 ## 1. Goal and constraints
 
@@ -149,12 +149,37 @@ The CLI reads user configuration from `~/.zcode/cli/config.json`, which is per u
 
 ### 4.6 Core change, in its own PR
 
-`packages/server/src/server/agent/plugin-provider.ts:157-170` gets two behavior changes.
+The plugin needs to own its binary discovery, and the daemon needs to keep owning the environment. Today neither is possible for a plugin.
 
-- When the plugin declares no default command but the user configured `agents.providers.<id>.command`, the override still applies.
-- When the default command's binary is missing and the user did not override it, resolution returns `undefined` instead of throwing, so the plugin's `status()` performs its own discovery. An override that points at a missing binary still fails hard, because a wrong explicit setting must be visible.
+`packages/server/src/server/agent/plugin-provider.ts:157-170` resolves the launch in this order:
 
-The change is under ten lines and benefits any plugin that owns binary discovery. It is reviewed and merged on its own before the plugin work starts, so the plugin PR contains no core diff.
+1. `registration.command` is absent, so the method returns `undefined` at line 159. The user's `agents.providers.<id>.command` override is never read, because it is only consulted inside the call at line 161.
+2. The default binary is missing, so line 168 throws. The plugin's `status()` callback never runs, so a plugin cannot fall back to its own discovery.
+
+The core already has the seam this needs: `ProviderLaunchDefault` at `packages/server/src/server/agent/provider-launch-config.ts:54-57` is `{ command, resolvePath? }`, and `resolveDefaultLaunchPath` at lines 79-85 calls that `resolvePath`. Core providers can use it. The plugin path cannot, because `resolveLaunch` passes a plain string.
+
+Two changes close the gap.
+
+**A new optional hook on the plugin SDK.** `ProviderRegistration` gains:
+
+```ts
+/** Resolve the default executable when the plugin owns binary discovery. */
+resolveCommand?(): Promise<readonly [string, ...string[]] | undefined>;
+```
+
+The hook is optional, so existing plugins keep working and `PROVIDER_PROTOCOL_VERSION` stays at 1.
+
+**Launch resolution follows one order.** `resolveLaunch()` becomes:
+
+1. A user override in `agents.providers.<id>.command` wins. A missing binary there fails hard, because a wrong explicit setting must be visible.
+2. Otherwise `registration.command`, then `registration.resolveCommand()`. A missing binary fails hard here too, since the plugin named a path it believes in.
+3. Otherwise the launch is `undefined`, and the plugin's `status()` reports why.
+
+The environment is attached in every case. `createProviderEnv({ runtimeSettings })` at line 165 supplies the user's `env` overrides and the parent-session stripping, and it must reach the spawned process regardless of who resolved the command. An earlier draft of this design returned `undefined` for the whole launch when the default binary was missing, which silently dropped that environment. The hook keeps it.
+
+The change is under twenty lines across the SDK type and the wrapper. It benefits any plugin that owns binary discovery, and it is reviewed and merged on its own before the plugin work starts, so the plugin PR contains no core diff.
+
+The plugin merges one extra variable into the launch environment when it selects the bundled runtime: `ELECTRON_RUN_AS_NODE=1`, matching how ZCode's own desktop starts it (`packages/services/src/zcode-agent/zcodeAgentProcessManager.ts:433-440`).
 
 ## 5. Protocol mapping
 
@@ -170,7 +195,7 @@ The change is under ten lines and benefits any plugin that owns binary discovery
 | `session.permission`                   | answers the pending `interaction/requestPermission`               | See section 5.3.                                                                                                                                          |
 | `session.configure`                    | `session/setModel`, `session/setMode`, `session/setThoughtLevel`  | ZCode modes `plan`, `build`, `edit`, `yolo`, `guarded`, `auto` pass through unchanged.                                                                    |
 | `session.archive`, `session.unarchive` | `session/close` with persistence, `session/resume`                |                                                                                                                                                           |
-| `session.can_stop_runtime`             | `session/read`                                                    | Answered from the session status.                                                                                                                         |
+| `session.can_stop_runtime`             | `session/read`                                                    | Whether the runtime may be released without losing background work or pending replies. Unrelated to turn cancellation.                                    |
 | `session.close`                        | `session/close`                                                   |                                                                                                                                                           |
 | `session.revert`                       | none in legacy                                                    | The capability stays undeclared. V4 supplies `applyFileRewind` and `editUserQuery`.                                                                       |
 
@@ -256,37 +281,53 @@ Paseo UI                 provider                ZCode CLI
 
 ZCode's two stop surfaces differ in exactly this respect.
 
-- Legacy `session/stop` takes only `sessionId` (`packages/shared/src/zcode-protocol/index.ts:2270-2274`). A late stop can cancel an unrelated later turn.
+- Legacy `session/stop` takes only `sessionId` (`packages/shared/src/zcode-protocol/index.ts:2270-2274`). The protocol offers no guard, so a stop that arrives late can cancel whatever turn is running by then.
 - V4 `stop` accepts `expectedForegroundExecutionId` (`packages/shared/src/zcode-protocol-v4/command.ts:161-164`), and the CLI rejects a stop whose identifier no longer matches the active execution.
 
-The provider implements the boundary on its own for the legacy transport: it tracks the foreground execution id it observed for the canceled turn, passes it to V4 when available, refuses new runs while a cancel is unsettled, and treats a second Stop as a retry of the first.
+The provider owns the boundary, because `docs/providers.md` requires it: "Own this in the provider, not in `AgentManager`". The provider runs the following state machine per session.
+
+**A stop is a state, not a call.** The provider holds a `stopping` turn state that carries the terminal the caller is still owed and the cancellation in flight. On `session.interrupt` the provider moves the active turn to `stopping` and emits no terminal yet.
+
+**A second Stop retries the first.** It never opens a second cancellation, and it never fires a detached retry that would outlive its boundary.
+
+**New runs are gated until the cancel settles.** The provider refuses a prompt, a slash command, or any other daemon-issued operation while a cancellation is unsettled. Settling means both the stop request has been answered and the canceled turn has produced its terminal event. Permission and question responses stay outside that gate, because gating them would deadlock an auto-approve against a stop.
+
+**The terminal is withheld until it is proven.** The provider emits `session.turn` with state `canceled` only after the cancellation settled. If the stop fails, the provider emits `session.turn` with state `failed` and the cancel error, and it refuses new runs until the next Stop issues a fresh cancellation. Failing closed is the point: a cancel that never succeeded never proved the run stopped.
+
+**Residue is suppressed only until the authoritative terminal.** Events ZCode emits for the canceled turn after the stop, such as a trailing `turn.failed`, are dropped. Anything arriving after the authoritative terminal belongs to a new run and takes the normal live path.
+
+**Legacy needs serialization instead of a guard.** The legacy protocol has no execution identifier to send, so the provider cannot ask ZCode to reject a stale stop. It prevents one instead: the provider issues no new prompt until the previous cancellation settled, and ZCode serializes command admission through its own inbox, so the stop is applied before the next prompt is admitted. The V4 transport passes `expectedForegroundExecutionId` and gets the guard from the CLI.
+
+**`session.can_stop_runtime` is a different question.** That capability reports whether the runtime may be released without losing background work or pending replies. It answers a runtime-release question, not a turn-cancellation one, and it plays no part in the stop boundary. A user stops a turn through `session.interrupt`.
 
 ## 6. Binary discovery
 
-Resolution order, first match wins.
+Resolution order, first match wins. It mirrors the order ZCode's own desktop uses in `resolveDefaultZCodeAgentCommand` (`packages/services/src/zcode-agent/zcodeAgentProcessManager.ts:443-468`).
 
 1. The user's `agents.providers.zcode.command` override, applied by the daemon.
-2. `zcode` on PATH.
-3. The runtime bundled with the ZCode desktop app: `zcode.cjs` or the native `zcode-agent` under the app's `resources/glm/` directory.
-4. The `GLM_BINARY_PATH` environment variable.
+2. `zcode` on PATH, the binary published by the `@zcode/cli` npm package.
+3. The runtime bundled with the ZCode desktop app, under the app's `resources/glm/` directory. When it is the JavaScript bundle `zcode.cjs`, the provider spawns the daemon's own runtime with it: `{ command: process.execPath, args: [bundlePath, "app-server", "--stdio"], env: { ELECTRON_RUN_AS_NODE: "1" } }`. This is the shape ZCode's desktop uses, and `ELECTRON_RUN_AS_NODE=1` keeps the child out of Electron's GPU startup path. When the bundle is the native `zcode-agent` binary, it is spawned directly.
+4. The `GLM_BINARY_PATH` environment variable, which is the variable ZCode's own runtime descriptor names (`packages/shared/src/zcode-agent-runtime.ts:31`).
+
+The provider returns the resolved command through the `resolveCommand` hook described in section 4.6. The daemon then attaches the environment it owns.
 
 `status()` reports which path was used in its diagnostic. When nothing resolves, it reports `available: false` with a diagnostic that lists all four options so the user can fix the provider without reading the source.
 
 ## 7. Error handling and lifecycle
 
-| Situation                                  | Behavior                                                                                            | What the user sees                                    |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| No binary found                            | `status()` returns `available: false` with a diagnostic naming all four paths                       | The provider is dimmed with actionable diagnostics    |
-| A user override points at a missing binary | Hard failure                                                                                        | The same, naming the configured path                  |
-| The CLI exits at startup                   | Capture the exit code and stderr, publish `session.runtime_failed`                                  | An error banner inside the session, retryable         |
-| A frame carries unknown fields             | The decoder drops the unknown fields and keeps the event                                            | Nothing; a debug log only                             |
-| A frame is structurally broken             | Count it in the diagnostic, do not kill the connection                                              | Diagnostic only                                       |
-| ZCode answers `method-not-found`           | The only downgradeable error; mark that capability unavailable and continue                         | The feature disappears, everything else keeps working |
-| Any other synchronous failure              | Propagate as `request.failed`                                                                       | The error surfaces in the requesting context          |
-| The CLI process dies                       | Publish `session.runtime_failed` and `session.closed` for every hosted session                      | Sessions turn red and can be reopened                 |
-| A turn never ends                          | Paseo sets no turn timeout; `session.interrupt` and `session.can_stop_runtime` let the user stop it | The user can interrupt                                |
-| A permission request stays unanswered      | The pending request is kept; an interrupt answers it with deny so the tool is released              | The tool does not hang forever                        |
-| stderr noise                               | Collected into the diagnostic and never mixed into stdout, which carries frames only                | Visible in diagnostics                                |
+| Situation                                  | Behavior                                                                               | What the user sees                                    |
+| ------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| No binary found                            | `status()` returns `available: false` with a diagnostic naming all four paths          | The provider is dimmed with actionable diagnostics    |
+| A user override points at a missing binary | Hard failure                                                                           | The same, naming the configured path                  |
+| The CLI exits at startup                   | Capture the exit code and stderr, publish `session.runtime_failed`                     | An error banner inside the session, retryable         |
+| A frame carries unknown fields             | The decoder drops the unknown fields and keeps the event                               | Nothing; a debug log only                             |
+| A frame is structurally broken             | Count it in the diagnostic, do not kill the connection                                 | Diagnostic only                                       |
+| ZCode answers `method-not-found`           | The only downgradeable error; mark that capability unavailable and continue            | The feature disappears, everything else keeps working |
+| Any other synchronous failure              | Propagate as `request.failed`                                                          | The error surfaces in the requesting context          |
+| The CLI process dies                       | Publish `session.runtime_failed` and `session.closed` for every hosted session         | Sessions turn red and can be reopened                 |
+| A turn never ends                          | Paseo sets no turn timeout; the user stops it through `session.interrupt`              | The user can interrupt                                |
+| A permission request stays unanswered      | The pending request is kept; an interrupt answers it with deny so the tool is released | The tool does not hang forever                        |
+| stderr noise                               | Collected into the diagnostic and never mixed into stdout, which carries frames only   | Visible in diagnostics                                |
 
 ZCode's frame schemas are strict and keep gaining fields, so the decoder stays more tolerant than ZCode: unknown fields are dropped and unknown event types are ignored, but a broken frame is never allowed to end the connection.
 
@@ -330,16 +371,16 @@ Total is about five weeks, of which the first three produce a usable provider.
 
 ### 9.1 Unit tests (`*.test.ts`)
 
-| Module                 | Cases                                                                                                                                                                                                    |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `binary.ts`            | PATH hit; PATH miss with the desktop bundle present; nothing found yields `available: false` with all four paths in the diagnostic; a user override wins over the other paths                            |
-| `wire.ts`              | Frames split on LF; a non-JSON frame is skipped without killing the connection; an unknown method is ignored; an unknown field is dropped but the event is still delivered; a large frame does not block |
-| `mapping.ts`           | A snapshot assertion for every ZCode event to `ProviderEvent` mapping; turn correlation; mode and model value mapping; permission option mapping                                                         |
-| Turn state machine     | `started` to `completed`; `started` to `failed`; `started` to `canceled`; an interrupt with no terminal state                                                                                            |
-| Capability negotiation | The legacy transport omits `revert.*` and `steer`; the V4 transport declares them; the intersection with the client's request                                                                            |
-| Permission round trip  | The selected option's `response` is returned unchanged; `permissionUpdates` pass through                                                                                                                 |
-| `plugin-provider.ts`   | A user override applies when no default command is declared; a missing default binary does not fail hard; a missing user override target still fails hard                                                |
-| Stop boundary          | A second Stop retries the in-flight cancel instead of opening a second one; new runs are refused while a cancel is unsettled; permission responses stay outside the gate                                 |
+| Module                 | Cases                                                                                                                                                                                                                                                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `binary.ts`            | PATH hit; PATH miss with the desktop bundle present; nothing found yields `available: false` with all four paths in the diagnostic; a user override wins over the other paths                                                                                                                              |
+| `wire.ts`              | Frames split on LF; a non-JSON frame is skipped without killing the connection; an unknown method is ignored; an unknown field is dropped but the event is still delivered; a large frame does not block                                                                                                   |
+| `mapping.ts`           | A snapshot assertion for every ZCode event to `ProviderEvent` mapping; turn correlation; mode and model value mapping; permission option mapping                                                                                                                                                           |
+| Turn state machine     | `started` to `completed`; `started` to `failed`; `started` to `canceled`; an interrupt with no terminal state                                                                                                                                                                                              |
+| Capability negotiation | The legacy transport omits `revert.*` and `steer`; the V4 transport declares them; the intersection with the client's request                                                                                                                                                                              |
+| Permission round trip  | The selected option's `response` is returned unchanged; `permissionUpdates` pass through                                                                                                                                                                                                                   |
+| `plugin-provider.ts`   | A user override wins over the plugin's own resolution; `resolveCommand` supplies the default when no override exists; a missing override target fails hard; the daemon-owned environment reaches the launch in every case                                                                                  |
+| Stop boundary          | A second Stop retries the in-flight cancel instead of opening a second one; new runs are refused while a cancel is unsettled; permission responses stay outside the gate; a failed cancel emits `failed` and keeps refusing new runs; trailing events for the canceled turn are dropped until its terminal |
 
 ### 9.2 End-to-end tests
 
@@ -356,8 +397,9 @@ ZCode handles its own authentication, so tests carry no auth checks, no environm
 
 ### P0
 
-- [ ] A user override applies when the plugin declares no default command, covered by a core regression test.
-- [ ] A missing default binary does not fail the launch resolution hard.
+- [ ] A user override wins over the plugin's own resolution, covered by a core regression test.
+- [ ] The `resolveCommand` hook supplies the default when no override exists, and the daemon-owned environment reaches the launch in both cases.
+- [ ] A missing binary named by a user override fails hard.
 - [ ] The provider appears in Paseo's provider list.
 - [ ] With no ZCode installed, the provider is unavailable and the diagnostic names all four resolution paths.
 
@@ -404,9 +446,11 @@ ZCode handles its own authentication, so tests carry no auth checks, no environm
 - `public-docs/plugins/providers.md` — the provider plugin contract
 - `packages/plugin/src/server/provider.ts` — `ProviderRegistration`, `ProviderInput`, `ProviderEvent`, capabilities
 - `packages/server/src/server/agent/plugin-provider.ts` — plugin provider wrapper, launch resolution
+- `packages/server/src/server/agent/provider-launch-config.ts` — `ProviderLaunchDefault`, executable resolution
 - `docs/testing.md` — test categories, file naming, CI routing
 - ZCode `packages/shared/src/zcode-protocol/index.ts` — legacy method table, event types, frame schemas
 - ZCode `packages/shared/src/zcode-protocol-v4/transport.ts` — V4 method table
 - ZCode `packages/shared/src/zcode-protocol-v4/command.ts` — V4 command payloads
 - ZCode `apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server.ts` — session map
 - ZCode `packages/shared/src/zcode-agent-runtime.ts` — bundled runtime descriptor
+- ZCode `packages/services/src/zcode-agent/zcodeAgentProcessManager.ts` — desktop binary resolution order, Electron runtime spawn
