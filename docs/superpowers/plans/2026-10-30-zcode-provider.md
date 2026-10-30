@@ -1509,7 +1509,7 @@ git commit -m "feat(plugins): run the ZCode app-server as a child process"
 
 - Consumes: `ZCodeProcess` from Task 5, `ZCodeRpcClient` from Task 4.
 - Produces:
-  - `interface ZCodeTransport` with `capabilities`, `createSession`, `resumeSession`, `send`, `stop`, `listSessions`, `setModel`, `setMode`, `setThoughtLevel`, `onEvent`, `close`.
+  - `interface ZCodeTransport` with `capabilities`, `createSession`, `resumeSession`, `send`, `stop`, `archive`, `readSnapshot`, `listSessions`, `setModel`, `setMode`, `setThoughtLevel`, `onEvent`, `onRequest`, `close`.
   - `createLegacyTransport(process): ZCodeTransport`.
 
 - [ ] **Step 1: Write the failing test**
