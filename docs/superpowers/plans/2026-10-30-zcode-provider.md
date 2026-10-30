@@ -17,10 +17,11 @@ These apply to every task. Copy them into the task brief you hand an implementer
 - The ZCode repository at `/Users/huazhongmin/IdeaProjects/ZCode` is read-only for this work. Nothing in this plan edits it.
 - The provider ships as a bundled plugin under `plugins/zcode-provider/`. Paseo core gains no provider manifest entry, no provider factory, and no protocol-layer provider id.
 - Provider protocol version stays `1`. `PROVIDER_PROTOCOL_VERSION` in `packages/plugin/src/server/provider.ts` is not changed.
-- `paseo-plugin.json` reads exactly `{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.0-beta.2" } }`. The floor is the release that carries the Task 1 launch-resolution fix.
-- The legacy transport declares exactly these capabilities: `prompt.message`, `prompt.command`, `prompt.image`, `permission`, `permission.tool_policy`, `session.configure`, `session.list`, `session.persistence`, `session.archive`, `session.unarchive`, `session.can_stop_runtime`, `session.subsession`, `timeline.plugin`. It does not declare `session.revert.conversation`, `session.revert.files`, `session.revert.both`, `prompt.steer`, or `prompt.output_schema`.
+- `paseo-plugin.json` reads exactly `{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.1-beta.1" } }`. The floor is the release that carries the Task 1 launch-resolution fix. `v0.14.0-beta.2` and `v0.14.0` are already published and both predate that fix, so a floor of `>=0.14.0-beta.2` would admit a daemon that ignores `resolveCommand` entirely and can never find the binary. The floor is load-bearing: `assertPluginCompatibility` runs inside `compileDirectoryPlugin`, which every start path goes through — `PluginService.start` for configured plugins and `PluginService.startBuiltinPlugin` for bundled ones — so an incompatible daemon refuses the plugin with a readable message instead of failing later on a strict metadata schema. Task 1 lands before the plugin work starts; confirm the floor against the release that actually carries it before the plugin ships. A checkout whose `package.json` version is below the floor will refuse to load the plugin, so the version has to reach the floor before the provider appears in a local daemon.
+- The legacy transport declares exactly these capabilities: `prompt.message`, `permission`, `permission.tool_policy`, `session.configure`, `session.list`, `session.persistence`, `session.archive`, `session.unarchive`, `session.can_stop_runtime`, `session.subsession`, `timeline.plugin`. It does not declare `session.revert.conversation`, `session.revert.files`, `session.revert.both`, `prompt.steer`, or `prompt.output_schema`.
+- The legacy transport does not declare `prompt.command` or `prompt.image` yet, even though the design's capability matrix lists both for the legacy transport. A declared capability is a promise the daemon trusts: the daemon routes a command or image prompt to the provider and rejects it only if the capability is absent. Declaring one the transport cannot honour turns a clean rejection into a runtime failure, and dropping an image silently loses the user's content. The legacy transport's `send` carries text only, and the plan has no grounded description of the ZCode attachment or slash-command wire format. Slash commands come from `available_commands_update` and land with the parity work the design schedules as P2. Both capabilities return with that work; until then the session rejects a command or a non-text part outright rather than pretending to handle it.
 - Binary resolution order, first match wins: the user's `agents.providers.zcode.command` override, then `zcode` on PATH, then the runtime bundled in the ZCode desktop app under `resources/glm/`, then the `GLM_BINARY_PATH` environment variable.
-- When the bundled JavaScript runtime is used, the child process runs as `{ command: process.execPath, args: [bundlePath, "app-server", "--stdio"], env: { ELECTRON_RUN_AS_NODE: "1" } }`.
+- When the bundled JavaScript runtime is used, the child process runs as `{ command: process.execPath, args: [bundlePath, "app-server", "--stdio"], env: { ELECTRON_RUN_AS_NODE: "1" } }`. The `resolveCommand` hook carries no environment: it returns the command and its arguments only. The plugin merges `ELECTRON_RUN_AS_NODE` at its own spawn site, keyed off the launch it was actually handed, because a user override can replace the command the hook resolved.
 - ZCode frames are `{ id, method, params? }` for requests, `{ id, result }` for responses, `{ id, error: { code, message, data? } }` for failures, and `{ eventId, sessionId, turnId?, seq, timestamp, type, payload? }` for events.
 - Every frame decoder is tolerant. Unknown fields are dropped, unknown event types are ignored, and a structurally broken frame is counted in the diagnostic rather than ending the connection.
 - ZCode delivers legacy events by cursor, not by push. Each session polls `session/events` with an `afterSeq` cursor.
@@ -46,25 +47,64 @@ Five input classes the spec implies that no task's happy path exercises. Each on
 
 The plugin needs to own binary discovery, and the daemon needs to keep owning the environment. Today neither is possible: `resolveLaunch` returns `undefined` before it reads the user's override, and it throws before the plugin's `status` can run.
 
+**The plugin's `ProviderRegistration` object lives in the plugin's child process.** The daemon never holds it. `packages/server/src/server/plugins/index.ts` rebuilds a proxy registration from the metadata the plugin sent, and every callback on that proxy is a message across the plugin IPC bridge. A new provider callback is therefore a bridge change, not just a type change: the SDK type, the process protocol, the plugin-side handler, the daemon-side request, and the proxy all move together. A hook that only exists in the SDK type is inert.
+
 **Files:**
 
 - Modify: `packages/plugin/src/server/provider.ts:29-43` — add the `resolveCommand` hook to `ProviderRegistration`
+- Modify: `packages/server/src/server/plugins/plugin-process-protocol.ts:17-26` — advertise the hook in the provider metadata
+- Modify: `packages/server/src/server/plugins/plugin-process-protocol.ts:34-78` — add the `provider.resolve_command` request
+- Modify: `packages/server/src/server/plugins/plugin-process-protocol.ts:114-125` — validate the new metadata field
+- Modify: `packages/server/src/server/plugins/plugin-process-protocol.ts:145-264` — validate the new request
+- Modify: `packages/server/src/server/plugins/plugin-process.ts:117-141` — validate the callback at registration
+- Modify: `packages/server/src/server/plugins/plugin-process.ts:158-168` — advertise the callback in the metadata
+- Modify: `packages/server/src/server/plugins/plugin-process.ts:363-378` — reject the request while the plugin is stopping
+- Modify: `packages/server/src/server/plugins/plugin-process.ts:466-495` — answer the request
+- Modify: `packages/server/src/server/plugins/runtime.ts:419-436` — the daemon-side request
+- Modify: `packages/server/src/server/plugins/index.ts:40-67` — the runtime port gains the request
+- Modify: `packages/server/src/server/plugins/index.ts:688-706` — the proxy gains the callback
 - Modify: `packages/server/src/server/agent/plugin-provider.ts:157-170` — one launch resolution order
 - Test: `packages/server/src/server/agent/plugin-provider.test.ts`
+- Test: `packages/server/src/server/plugins/index.posix.test.ts`
 
 **Interfaces:**
 
 - Consumes: nothing from other tasks.
-- Produces: `ProviderRegistration.resolveCommand?(): Promise<readonly [string, ...string[]] | undefined>` (SDK type), and a `resolveLaunch` that returns a complete `ProviderLaunch` whenever a command was resolved by any of the three sources.
+- Produces:
+  - `ProviderRegistration.resolveCommand?(): Promise<readonly [string, ...string[]] | undefined>` (SDK type, published in `@getpaseo/plugin`).
+  - `PluginRuntime.resolveProviderCommand(pluginId, providerId): Promise<readonly [string, ...string[]] | undefined>` (daemon side).
+  - A `resolveLaunch` that returns a complete `ProviderLaunch` whenever a command was resolved by any of the three sources.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
-Append to `packages/server/src/server/agent/plugin-provider.test.ts`:
+Append to `packages/server/src/server/agent/plugin-provider.test.ts`. Add `writeFile` and `chmod` to the `node:fs/promises` import.
 
 ```ts
 describe("plugin launch resolution", () => {
-  function registrationWith(
+  const logger = createTestLogger();
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * The launch path is resolved on disk, so a command that does not exist
+   * fails before the provider reports anything. Every path here is a real
+   * executable.
+   */
+  async function executable(name: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "paseo-launch-"));
+    dirs.push(dir);
+    const file = join(dir, name);
+    await writeFile(file, "#!/bin/sh\n");
+    await chmod(file, 0o755);
+    return file;
+  }
+
+  function probeRegistration(
     resolveCommand: () => Promise<readonly [string, ...string[]] | undefined>,
+    launches: (ProviderLaunch | undefined)[],
   ): ProviderRegistration {
     return {
       id: "launch-resolution-probe",
@@ -73,7 +113,8 @@ describe("plugin launch resolution", () => {
         return resolveCommand();
       },
       async status({ launch }) {
-        return { available: true, diagnostic: launch ? launch.command : "no-launch" };
+        launches.push(launch);
+        return { available: true, diagnostic: launch?.command ?? "no-launch" };
       },
       async connect() {
         throw new Error("not used");
@@ -81,53 +122,128 @@ describe("plugin launch resolution", () => {
     };
   }
 
-  test("a user command override wins over the plugin's own resolution", async () => {
-    const logger = createTestLogger();
+  function clientFor(
+    registration: ProviderRegistration,
+    options?: {
+      command?: string[];
+      appendArgs?: string[];
+    },
+  ): AgentClient {
     const plugins = new PluginAgentClientRegistry(logger);
-    plugins.replace([registrationWith(async () => ["/plugin/owned/zcode"])]);
-    buildProviderRegistry(logger, {
+    plugins.replace([registration]);
+    const registry = buildProviderRegistry(logger, {
       pluginProviders: plugins.definitions(),
-      providerOverrides: {
-        "launch-resolution-probe": {
-          command: { mode: "replace", argv: ["/user/chosen/zcode"] },
-        },
-      },
+      ...(options?.command
+        ? {
+            providerOverrides: {
+              "launch-resolution-probe": { command: options.command },
+            },
+          }
+        : {}),
+      ...(options?.appendArgs
+        ? {
+            runtimeSettings: {
+              "launch-resolution-probe": {
+                command: { mode: "append", args: options.appendArgs },
+              },
+            },
+          }
+        : {}),
     });
-    const client = plugins.clients()["launch-resolution-probe"]!;
+    return registry["launch-resolution-probe" as AgentClient["provider"]].createClient(logger);
+  }
+
+  test("a user command override wins over the plugin's own resolution", async () => {
+    const launches: (ProviderLaunch | undefined)[] = [];
+    const pluginCommand = await executable("plugin-zcode");
+    const userCommand = await executable("user-zcode");
+    const client = clientFor(
+      probeRegistration(async () => [pluginCommand], launches),
+      { command: [userCommand] },
+    );
     await expect(client.isAvailable()).resolves.toBe(true);
+    // Assert which command was resolved. isAvailable() returning true passes
+    // whether or not the override won.
+    expect(launches.at(-1)?.command).toBe(userCommand);
   });
 
   test("the plugin's own resolution supplies the command when the user set none", async () => {
-    const logger = createTestLogger();
-    const plugins = new PluginAgentClientRegistry(logger);
-    plugins.replace([registrationWith(async () => ["/plugin/owned/zcode"])]);
-    buildProviderRegistry(logger, { pluginProviders: plugins.definitions() });
-    const client = plugins.clients()["launch-resolution-probe"]!;
+    const launches: (ProviderLaunch | undefined)[] = [];
+    const pluginCommand = await executable("plugin-zcode");
+    const client = clientFor(probeRegistration(async () => [pluginCommand], launches));
     await expect(client.isAvailable()).resolves.toBe(true);
+    expect(launches.at(-1)?.command).toBe(pluginCommand);
+  });
+
+  test("an append override keeps the plugin's own command", async () => {
+    const launches: (ProviderLaunch | undefined)[] = [];
+    const pluginCommand = await executable("plugin-zcode");
+    const client = clientFor(
+      probeRegistration(async () => [pluginCommand], launches),
+      {
+        appendArgs: ["--extra"],
+      },
+    );
+    await expect(client.isAvailable()).resolves.toBe(true);
+    expect(launches.at(-1)?.command).toBe(pluginCommand);
   });
 
   test("a missing user override target fails hard", async () => {
-    const logger = createTestLogger();
-    const plugins = new PluginAgentClientRegistry(logger);
-    plugins.replace([registrationWith(async () => ["/plugin/owned/zcode"])]);
-    buildProviderRegistry(logger, {
-      pluginProviders: plugins.definitions(),
-      providerOverrides: {
-        "launch-resolution-probe": {
-          command: { mode: "replace", argv: ["/definitely/missing/zcode"] },
-        },
+    const launches: (ProviderLaunch | undefined)[] = [];
+    const pluginCommand = await executable("plugin-zcode");
+    const client = clientFor(
+      probeRegistration(async () => [pluginCommand], launches),
+      {
+        command: [join(dirname(pluginCommand), "definitely-missing-zcode")],
       },
-    });
-    const client = plugins.clients()["launch-resolution-probe"]!;
+    );
     await expect(client.isAvailable()).resolves.toBe(false);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+`providerOverrides.<id>.command` is the user-facing setting and is a string array; the registry turns it into a `replace` command. `runtimeSettings.<id>.command` carries the `append` mode. The two are different sources, and a test that uses the wrong one proves nothing.
 
-Run: `npx vitest run packages/server/src/server/agent/plugin-provider.test.ts --bail=1`
-Expected: FAIL. The `resolveCommand` property does not exist on `ProviderRegistration`, so the test file fails to typecheck or the override is ignored.
+Append to `packages/server/src/server/plugins/index.posix.test.ts`. This is the test that proves the hook survives the trip through the plugin process. A test that only exercises an in-process registration object proves nothing about the bridge.
+
+```ts
+it("carries a provider's resolved command across the plugin process", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+  roots.push(home);
+  const directory = await createPlugin(
+    "provider-resolve-command",
+    `export default function contribute(server) {
+      server.registerProvider({ id: "plugin-agent", label: "Plugin agent",
+        async resolveCommand() { return ["/plugin/owned/zcode", "app-server", "--stdio"]; },
+        async connect() { throw new Error("not opened by this test"); },
+      });
+      return () => {};
+    }`,
+  );
+  const service = createService(home);
+  await service.start();
+  try {
+    if (service.installDirectory) await service.installDirectory({ path: directory });
+    const [registration] = service.getProviderRegistrations();
+    expect(registration).toMatchObject({ id: "plugin-agent" });
+    await expect(registration!.resolveCommand!()).resolves.toEqual([
+      "/plugin/owned/zcode",
+      "app-server",
+      "--stdio",
+    ]);
+  } finally {
+    await service.stopAllPlugins();
+  }
+});
+```
+
+Match the surrounding test in `index.posix.test.ts` for how it creates a service and installs a plugin directory. The other tests in that file use `createService(home)` plus `await service.installDirectory({ path: directory })`, and some use `new PluginService(...)` with `BuiltinPluginLoader`. Use whichever the neighbouring tests use so the test runs in the same environment.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npx vitest run packages/server/src/server/agent/plugin-provider.test.ts packages/server/src/server/plugins/index.posix.test.ts --bail=1`
+
+Expected: FAIL. The `resolveCommand` property does not exist on `ProviderRegistration`, so the test file fails to typecheck, and the bridge test finds no `resolveCommand` on the published registration.
 
 - [ ] **Step 3: Add the hook to the SDK type**
 
@@ -144,6 +260,7 @@ export interface ProviderRegistration {
   /**
    * Resolve the default executable when the plugin owns binary discovery.
    * A user override in agents.providers.<id>.command still wins over this.
+   * Return undefined when nothing was found; the plugin's status reports why.
    */
   resolveCommand?(): Promise<readonly [string, ...string[]] | undefined>;
   status?(request: ProviderStatusRequest): Promise<ProviderStatus>;
@@ -156,49 +273,188 @@ export interface ProviderRegistration {
 }
 ```
 
-- [ ] **Step 4: Rewrite launch resolution**
+- [ ] **Step 4: Extend the plugin process protocol**
+
+In `packages/server/src/server/plugins/plugin-process-protocol.ts`:
+
+Add to `PluginProviderMetadata`:
+
+```ts
+  hasResolveCommand?: boolean;
+```
+
+Add to `providerMetadataSchema`:
+
+```ts
+    hasResolveCommand: z.boolean().optional(),
+```
+
+Add to `PluginProcessRequest`:
+
+```ts
+  | {
+      type: "provider.resolve_command";
+      requestId: string;
+      providerId: string;
+    }
+```
+
+Add to `PluginProcessRequestSchema`:
+
+```ts
+    z
+      .object({
+        type: z.literal("provider.resolve_command"),
+        requestId: z.string().min(1),
+        providerId: z.string().min(1),
+      })
+      .strict(),
+```
+
+- [ ] **Step 5: Answer the request in the plugin process**
+
+In `packages/server/src/server/plugins/plugin-process.ts`:
+
+Validate the callback in `registerProvider`, next to the existing `getCatalogCacheKey` and `status` checks:
+
+```ts
+if (provider.resolveCommand !== undefined && typeof provider.resolveCommand !== "function")
+  throw new Error(`Invalid command resolution callback for plugin provider ${id}`);
+```
+
+Advertise it in `providerMetadata`:
+
+```ts
+      hasResolveCommand: provider.resolveCommand !== undefined,
+```
+
+Add `provider.resolve_command` to the request types `rejectWhileStopping` rejects:
+
+```ts
+      message.type === "provider.resolve_command" ||
+```
+
+Handle the request, next to the `provider.status` and `provider.catalog_key` handlers:
+
+```ts
+if (message.type === "provider.resolve_command") {
+  void (async () => {
+    const provider = providers.get(message.providerId);
+    if (!provider) throw new Error(`Unknown provider: ${message.providerId}`);
+    if (!provider.resolveCommand)
+      throw new Error(`Provider cannot resolve a command: ${message.providerId}`);
+    const output = await provider.resolveCommand();
+    if (output !== undefined && !isResolvedCommand(output))
+      throw new Error("Invalid resolved command");
+    send({ type: "result", requestId: message.requestId, output });
+  })().catch((error) =>
+    send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+  );
+  return;
+}
+```
+
+Add the validator next to the other module-level helpers:
+
+```ts
+function isResolvedCommand(value: unknown): value is readonly [string, ...string[]] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((part) => typeof part === "string" && part.trim().length > 0)
+  );
+}
+```
+
+- [ ] **Step 6: Add the daemon-side request**
+
+In `packages/server/src/server/plugins/runtime.ts`, next to `getProviderStatus`:
+
+```ts
+  async resolveProviderCommand(
+    pluginId: string,
+    providerId: string,
+  ): Promise<readonly [string, ...string[]] | undefined> {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded) throw new Error(`Plugin is not available: ${pluginId}`);
+    const output = await this.request(loaded, {
+      type: "provider.resolve_command",
+      requestId: randomUUID(),
+      providerId,
+    });
+    return isResolvedCommand(output) ? output : undefined;
+  }
+```
+
+Export `isResolvedCommand` from `plugin-process-protocol.ts` so both sides share one definition, and import it in `runtime.ts`.
+
+- [ ] **Step 7: Rebuild the proxy registration**
+
+In `packages/server/src/server/plugins/index.ts`, add to `PluginRuntimePort`:
+
+```ts
+  resolveProviderCommand?: PluginRuntime["resolveProviderCommand"];
+```
+
+Add to the registration the proxy builds:
+
+```ts
+          resolveCommand: provider.hasResolveCommand
+            ? () => {
+                if (!this.runtime.resolveProviderCommand)
+                  throw new Error("Plugin runtime cannot resolve provider commands");
+                return this.runtime.resolveProviderCommand(pluginId, provider.id);
+              }
+            : undefined,
+```
+
+- [ ] **Step 8: Rewrite launch resolution**
 
 In `packages/server/src/server/agent/plugin-provider.ts`, replace the body of `resolveLaunch` so it reads:
 
 ```ts
-private async resolveLaunch(): Promise<ProviderLaunch | undefined> {
-  const env = createProviderEnv({ runtimeSettings: this.runtimeSettings });
-  const override = this.runtimeSettings?.command;
-  if (override) {
-    const launch = await resolveProviderLaunch({ commandConfig: override });
+  private async resolveLaunch(): Promise<ProviderLaunch | undefined> {
+    const env = createProviderEnv({ runtimeSettings: this.runtimeSettings });
+    const override = this.runtimeSettings?.command;
+    if (override?.mode === "replace") {
+      const launch = await resolveProviderLaunch({ commandConfig: override });
+      launch.env = env;
+      const availability = await checkProviderLaunchAvailable(launch);
+      if (!availability.resolvedPath)
+        throw new Error(`${launch.command} not found on PATH`);
+      return { command: resolvePath(availability.resolvedPath), args: launch.args, env };
+    }
+    const command = this.registration.command ?? (await this.registration.resolveCommand?.());
+    if (!command) return undefined;
+    const launch = await resolveProviderLaunch({
+      commandConfig: override,
+      defaultBinary: command[0],
+    });
+    if (launch.source !== "override") launch.args.unshift(...command.slice(1));
     launch.env = env;
     const availability = await checkProviderLaunchAvailable(launch);
-    if (!availability.resolvedPath)
-      throw new Error(`${launch.command} not found on PATH`);
+    if (!availability.resolvedPath) throw new Error(`${launch.command} not found on PATH`);
     return { command: resolvePath(availability.resolvedPath), args: launch.args, env };
   }
-  const command = this.registration.command ?? (await this.registration.resolveCommand?.());
-  if (!command) return undefined;
-  const launch = await resolveProviderLaunch({ defaultBinary: command[0] });
-  launch.args.unshift(...command.slice(1));
-  launch.env = env;
-  const availability = await checkProviderLaunchAvailable(launch);
-  if (!availability.resolvedPath) throw new Error(`${launch.command} not found on PATH`);
-  return { command: resolvePath(availability.resolvedPath), args: launch.args, env };
-}
 ```
 
-`resolveProviderLaunch` throws when `defaultBinary` is undefined and the mode is not `replace`. The override branch passes only `commandConfig`, so it requires the override to be a `replace`. That is the documented shape of `agents.providers.<id>.command`.
+`ProviderCommand` has three modes. Only `replace` replaces the command, so only `replace` short-circuits the plugin's own resolution. `default` and `append` keep the plugin's command and add the override's arguments to it. `resolveProviderLaunch` throws when `defaultBinary` is undefined and the mode is not `replace`, so the `replace` branch is the only one that may omit `defaultBinary`.
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [ ] **Step 9: Run the tests to verify they pass**
 
-Run: `npx vitest run packages/server/src/server/agent/plugin-provider.test.ts --bail=1`
+Run: `npx vitest run packages/server/src/server/agent/plugin-provider.test.ts packages/server/src/server/plugins/index.posix.test.ts --bail=1`
+
 Expected: PASS.
 
-- [ ] **Step 6: Typecheck and lint**
+- [ ] **Step 10: Typecheck and lint**
 
 Run: `npm run typecheck && npm run lint`
 Expected: clean.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add packages/plugin/src/server/provider.ts packages/server/src/server/agent/plugin-provider.ts packages/server/src/server/agent/plugin-provider.test.ts
+git add packages/plugin/src/server/provider.ts packages/server/src/server/plugins/plugin-process-protocol.ts packages/server/src/server/plugins/plugin-process.ts packages/server/src/server/plugins/runtime.ts packages/server/src/server/plugins/index.ts packages/server/src/server/agent/plugin-provider.ts packages/server/src/server/agent/plugin-provider.test.ts packages/server/src/server/plugins/index.posix.test.ts
 git commit -m "feat(plugins): let a plugin resolve its own default executable
 
 A plugin that owns binary discovery could not use it. Launch resolution
@@ -206,8 +462,9 @@ returned early when the plugin declared no command, so the user's
 agents.providers.<id>.command override was never read, and it threw on a
 missing default binary before the plugin's status callback could run.
 
-Add an optional resolveCommand hook and one resolution order: a user
-override wins, then the plugin's declared command, then the plugin's own
+Add an optional resolveCommand hook and carry it across the plugin
+process boundary, then follow one resolution order: a replace override
+wins, then the plugin's declared command, then the plugin's own
 resolution. The daemon-owned environment reaches the launch in every
 case."
 ```
@@ -224,15 +481,16 @@ This commit is its own pull request. It merges before the plugin work starts, so
 - Create: `plugins/zcode-provider/index.server.ts`
 - Create: `plugins/zcode-provider/icon.svg`
 - Create: `plugins/zcode-provider/server/provider.ts`
+- Create: `plugins/zcode-provider/server/capabilities.ts`
 - Create: `plugins/zcode-provider/server/internal/binary.ts`
+- Modify: `packages/server/src/server/plugins/builtin/index.ts:5-19` — add the plugin to the bundled plugin list
 - Test: `plugins/zcode-provider/server/internal/binary.test.ts`
 
 **Interfaces:**
 
 - Consumes: `ProviderRegistration.resolveCommand?` from Task 1.
 - Produces:
-  - `resolveZCodeCommand(): Promise<readonly [string, ...string[]] | undefined>` — the discovery result, or `undefined` when nothing was found.
-  - `describeZCodeBinary(command): string` — a one-line diagnostic naming the source.
+  - `resolveZCodeCommand(options: ZCodeDiscoveryOptions): Promise<readonly [string, ...string[]] | undefined>` — the discovery result, or `undefined` when nothing was found.
   - `ZCODE_NOT_FOUND_DIAGNOSTIC: string` — the diagnostic listing all four resolution paths.
 
 - [ ] **Step 1: Write the failing test**
@@ -419,7 +677,7 @@ Expected: PASS.
 Create `plugins/zcode-provider/paseo-plugin.json`:
 
 ```json
-{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.0-beta.2" } }
+{ "id": "zcode-provider", "requirements": { "paseo": ">=0.14.1-beta.1" } }
 ```
 
 Create `plugins/zcode-provider/icon.svg` as a single-color, `currentColor` SVG with `viewBox="0 0 24 24"` and no external references.
@@ -435,8 +693,6 @@ import type { ProviderCapability } from "@getpaseo/plugin/server/provider";
  */
 export const ZCODE_CAPABILITIES = [
   "prompt.message",
-  "prompt.command",
-  "prompt.image",
   "permission",
   "permission.tool_policy",
   "session.configure",
@@ -455,11 +711,16 @@ The capabilities live in their own module because the transport imports them and
 Create `plugins/zcode-provider/index.server.ts`:
 
 ```ts
-import { registerProvider } from "@getpaseo/plugin/server";
+import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createZCodeProvider } from "./server/provider.js";
 
-export default registerProvider(createZCodeProvider());
+export default function contribute(server: PluginServerContext) {
+  server.registerProvider(createZCodeProvider());
+  return () => {};
+}
 ```
+
+`@getpaseo/plugin/server` exports `PluginServerContext` as a type and the `spawnProcess`, `execCommand`, `terminateProcess`, and `defineAgentTool` values. There is no `registerProvider` export; the registration happens through the server context the daemon hands the plugin. Every bundled plugin in `plugins/` uses this shape.
 
 Create `plugins/zcode-provider/server/provider.ts`:
 
@@ -485,11 +746,7 @@ export function createZCodeProvider(): ProviderRegistration {
     description: "ZCode agent on your host, driven over its app-server protocol",
     icon: "icon.svg",
     async resolveCommand() {
-      return resolveZCodeCommand({
-        pathEntries: (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":"),
-        env: process.env,
-        desktopRoots: await listDesktopAppRoots(defaultDesktopRoots()),
-      });
+      return resolveCommand();
     },
     async status({ launch }): Promise<ProviderStatus> {
       if (!launch) {
@@ -503,6 +760,26 @@ export function createZCodeProvider(): ProviderRegistration {
     },
   };
 }
+
+/**
+ * The daemon probes availability whenever it lists providers and before every
+ * connection. Resolution scans PATH and the desktop app roots, so the result is
+ * memoized briefly instead of repeating the scan on every probe.
+ */
+const RESOLUTION_CACHE_MS = 5_000;
+let cached: { at: number; value: readonly [string, ...string[]] | undefined } | undefined;
+
+async function resolveCommand(): Promise<readonly [string, ...string[]] | undefined> {
+  const now = Date.now();
+  if (cached && now - cached.at < RESOLUTION_CACHE_MS) return cached.value;
+  const value = await resolveZCodeCommand({
+    pathEntries: (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":"),
+    env: process.env,
+    desktopRoots: await listDesktopAppRoots(defaultDesktopRoots()),
+  });
+  cached = { at: now, value };
+  return value;
+}
 ```
 
 `createConnection` is added in Task 9. Until then, stub it:
@@ -513,15 +790,42 @@ function createConnection(_capabilities: readonly string[]): ProviderConnection 
 }
 ```
 
-- [ ] **Step 6: Run typecheck and lint**
+- [ ] **Step 6: Register the plugin as a bundled plugin**
+
+A bundled plugin is only loaded if it appears in the `builtinPlugins` list in `packages/server/src/server/plugins/builtin/index.ts`. Add the id to that list, keeping the list alphabetical:
+
+```ts
+export const builtinPlugins = [
+  "antigravity-provider",
+  "claude-usage-source",
+  "codex-usage-source",
+  "copilot-usage-source",
+  "cursor-usage-source",
+  "grok-usage-source",
+  "hoplite-provider",
+  "kimi-usage-source",
+  "minimax-usage-source",
+  "muse-provider",
+  "opencode-go-usage-source",
+  "worktree-include",
+  "zai-usage-source",
+  "zcode-provider",
+] as const;
+```
+
+This is not a provider manifest entry, a provider factory, or a protocol-layer provider id. The daemon still learns about ZCode only through the plugin's own registration.
+
+`scripts/builtin-plugins-dist.test.mjs` iterates `builtinPlugins` and asserts that every listed plugin has a manifest whose id matches, compiles, and starts. Adding the id there brings the packaged build under that test for free.
+
+- [ ] **Step 7: Run typecheck and lint**
 
 Run: `npm run typecheck && npm run lint`
 Expected: clean.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add plugins/zcode-provider
+git add plugins/zcode-provider packages/server/src/server/plugins/builtin/index.ts
 git commit -m "feat(plugins): add the ZCode provider skeleton and binary discovery
 
 Resolve the ZCode executable from PATH, from the runtime bundled in the
@@ -645,7 +949,13 @@ const responseFrameSchema = z
       .object({ code: z.number().int(), message: z.string(), data: z.unknown().optional() })
       .optional(),
   })
-  .passthrough();
+  .passthrough()
+  // A response frame carries a result or an error. Without this, a bare
+  // `{ id }` frame parses as a successful response with an undefined result,
+  // and the pending request resolves with nothing.
+  .refine((value) => value.result !== undefined || value.error !== undefined, {
+    message: "A response frame carries a result or an error",
+  });
 
 export type ZCodeEventFrame = z.infer<typeof eventFrameSchema>;
 
@@ -731,23 +1041,45 @@ Create `plugins/zcode-provider/server/internal/rpc.test.ts`:
 import { describe, expect, test } from "vitest";
 import { ZCodeRpcClient, isMethodNotFound } from "./rpc.js";
 
+/**
+ * The base client has no output stream; it throws when a call writes. The
+ * process layer supplies one, so the test supplies one too.
+ */
+class TestRpcClient extends ZCodeRpcClient {
+  readonly written: string[] = [];
+
+  protected override write(line: string): void {
+    this.written.push(line);
+  }
+}
+
 describe("ZCode RPC client", () => {
   test("resolves a call when the matching response arrives", async () => {
-    const client = new ZCodeRpcClient();
+    const client = new TestRpcClient();
     const pending = client.call("session/read", { sessionId: "s1" });
     client.receive(JSON.stringify({ id: "1", result: { ok: true } }));
     await expect(pending).resolves.toEqual({ ok: true });
   });
 
+  test("writes the encoded request with its own id", () => {
+    const client = new TestRpcClient();
+    void client.call("session/read", { sessionId: "s1" }).catch(() => undefined);
+    expect(JSON.parse(client.written[0]!)).toEqual({
+      id: "1",
+      method: "session/read",
+      params: { sessionId: "s1" },
+    });
+  });
+
   test("rejects a call when the protocol answers with an error", async () => {
-    const client = new ZCodeRpcClient();
+    const client = new TestRpcClient();
     const pending = client.call("session/read", { sessionId: "s1" });
     client.receive(JSON.stringify({ id: "1", error: { code: -32601, message: "no method" } }));
     await expect(pending).rejects.toThrow("no method");
   });
 
   test("recognizes a method-not-found failure", async () => {
-    const client = new ZCodeRpcClient();
+    const client = new TestRpcClient();
     const pending = client.call("session/steer", { sessionId: "s1" });
     client.receive(JSON.stringify({ id: "1", error: { code: -32601, message: "no method" } }));
     const error = await pending.catch((value: unknown) => value);
@@ -755,7 +1087,7 @@ describe("ZCode RPC client", () => {
   });
 
   test("dispatches events to listeners and survives a broken frame", () => {
-    const client = new ZCodeRpcClient();
+    const client = new TestRpcClient();
     const seen: string[] = [];
     client.onEvent((event) => seen.push(event.type));
     client.receive("{broken");
@@ -769,6 +1101,13 @@ describe("ZCode RPC client", () => {
       }),
     );
     expect(seen).toEqual(["turn.started"]);
+  });
+
+  test("rejects every pending call when the connection closes", async () => {
+    const client = new TestRpcClient();
+    const pending = client.call("session/read", { sessionId: "s1" });
+    client.close();
+    await expect(pending).rejects.toThrow(/closed/i);
   });
 });
 ```
@@ -935,26 +1274,30 @@ const fakeServer = fileURLToPath(new URL("../../test/fake-zcode-app-server.mjs",
 
 describe("ZCode process lifecycle", () => {
   test("answers a call over the child's stdio", async () => {
-    const process = startZCodeProcess({
+    // The binding is not named `process`: it would shadow the global inside
+    // its own initializer and `process.execPath` would throw a TDZ error.
+    const zcode = startZCodeProcess({
       command: process.execPath,
       args: [fakeServer],
-      env: { FAKE_ZCODE_MODE: "ok" },
+      env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
     });
-    await expect(process.rpc.call("session/read", { sessionId: "s1" })).resolves.toEqual({});
-    await process.exit();
+    await expect(zcode.rpc.call("session/read", { sessionId: "s1" })).resolves.toEqual({});
+    await zcode.exit();
   });
 
   test("reports a startup failure with the child's stderr", async () => {
-    const process = startZCodeProcess({
+    const zcode = startZCodeProcess({
       command: process.execPath,
       args: [fakeServer],
-      env: { FAKE_ZCODE_MODE: "stderr" },
+      env: { ...process.env, FAKE_ZCODE_MODE: "stderr" },
     });
-    await expect(process.ready).rejects.toThrow(/runtime missing/);
-    await process.exit();
+    await expect(zcode.ready).rejects.toThrow(/runtime missing/);
+    await zcode.exit();
   });
 });
 ```
+
+`spawnProcess` hands `options.env` to the child as-is; the child does not inherit `process.env`. A test that passes only `FAKE_ZCODE_MODE` gives the child an environment with nothing else in it. The real connection passes the daemon-owned launch environment, which is already complete.
 
 - [ ] **Step 3: Run the test to verify it fails**
 
@@ -1099,12 +1442,12 @@ const fakeServer = fileURLToPath(new URL("../../test/fake-zcode-app-server.mjs",
 
 describe("legacy ZCode transport", () => {
   test("sends a prompt and acknowledges it", async () => {
-    const process = startZCodeProcess({
+    const zcode = startZCodeProcess({
       command: process.execPath,
       args: [fakeServer],
-      env: { FAKE_ZCODE_MODE: "ok" },
+      env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
     });
-    const transport = createLegacyTransport(process);
+    const transport = createLegacyTransport(zcode);
     await transport.createSession({
       workspacePath: "/tmp/project",
       workspaceKey: "/tmp/project",
@@ -1116,12 +1459,12 @@ describe("legacy ZCode transport", () => {
   });
 
   test("does not advertise rewind or steer", () => {
-    const process = startZCodeProcess({
+    const zcode = startZCodeProcess({
       command: process.execPath,
       args: [fakeServer],
-      env: { FAKE_ZCODE_MODE: "ok" },
+      env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
     });
-    const transport = createLegacyTransport(process);
+    const transport = createLegacyTransport(zcode);
     expect(transport.capabilities).not.toContain("session.revert.conversation");
     expect(transport.capabilities).not.toContain("prompt.steer");
     expect(transport.capabilities).toContain("prompt.message");
@@ -1139,6 +1482,8 @@ Expected: FAIL with "Cannot find module './transport.js'".
 Create `plugins/zcode-provider/server/internal/transport.ts`:
 
 ```ts
+import type { ZCodeConfigOption } from "./catalog.js";
+
 export interface ZCodeWorkspaceRef {
   workspacePath: string;
   workspaceKey: string;
@@ -1163,6 +1508,13 @@ export interface ZCodeTransport {
   }): Promise<ZCodeSessionHandle>;
   send(input: { sessionId: string; content: string; inputId: string }): Promise<void>;
   stop(input: { sessionId: string }): Promise<void>;
+  /** Closes the ZCode session without ending the app-server process. */
+  archive(input: { sessionId: string }): Promise<void>;
+  /**
+   * Reads a session snapshot. ZCode returns its model, mode and thought-level
+   * options on the snapshot, so the catalog is read through a session.
+   */
+  readSnapshot(input: { sessionId: string }): Promise<{ configOptions?: ZCodeConfigOption[] }>;
   listSessions(input: { workspace?: ZCodeWorkspaceRef; limit?: number }): Promise<unknown[]>;
   setModel(input: { sessionId: string; model: string }): Promise<void>;
   setMode(input: { sessionId: string; mode: string }): Promise<void>;
@@ -1201,37 +1553,46 @@ export function createLegacyTransport(process: ZCodeProcess): ZCodeTransport {
   const listeners = new Set<(event: ZCodeEvent) => void>();
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;
+  let polling = false;
 
   async function poll(): Promise<void> {
-    for (const [sessionId, cursor] of cursors) {
-      try {
-        const result = (await process.rpc.call("session/events", {
-          sessionId,
-          afterSeq: cursor,
-        })) as { events?: unknown[] };
-        for (const raw of result?.events ?? []) {
-          const event = raw as {
-            type?: string;
-            sessionId?: string;
-            turnId?: string;
-            seq?: number;
-            payload?: unknown;
-          };
-          if (!event.type || !event.sessionId || typeof event.seq !== "number") continue;
-          cursors.set(sessionId, event.seq);
-          const mapped: ZCodeEvent = {
-            type: event.type,
-            sessionId: event.sessionId,
-            turnId: event.turnId,
-            seq: event.seq,
-            payload: event.payload,
-          };
-          for (const listener of listeners) listener(mapped);
+    // setInterval does not wait for the previous tick. A poll that outlives the
+    // interval would read the same cursor twice and deliver every event twice.
+    if (polling) return;
+    polling = true;
+    try {
+      for (const [sessionId, cursor] of cursors) {
+        try {
+          const result = (await process.rpc.call("session/events", {
+            sessionId,
+            afterSeq: cursor,
+          })) as { events?: unknown[] };
+          for (const raw of result?.events ?? []) {
+            const event = raw as {
+              type?: string;
+              sessionId?: string;
+              turnId?: string;
+              seq?: number;
+              payload?: unknown;
+            };
+            if (!event.type || !event.sessionId || typeof event.seq !== "number") continue;
+            cursors.set(sessionId, event.seq);
+            const mapped: ZCodeEvent = {
+              type: event.type,
+              sessionId: event.sessionId,
+              turnId: event.turnId,
+              seq: event.seq,
+              payload: event.payload,
+            };
+            for (const listener of listeners) listener(mapped);
+          }
+        } catch {
+          // A failed poll is retried on the next tick; the session's own
+          // error path reports the failure if the process is gone.
         }
-      } catch {
-        // A failed poll is retried on the next tick; the session's own
-        // error path reports the failure if the process is gone.
       }
+    } finally {
+      polling = false;
     }
   }
 
@@ -1396,7 +1757,20 @@ Create `plugins/zcode-provider/server/internal/session.test.ts`:
 ```ts
 import { describe, expect, test, vi } from "vitest";
 import { ZCodeSession } from "./session.js";
+import type { ProviderEvent, ProviderPrompt } from "@getpaseo/plugin/server/provider";
 import type { ZCodeEvent, ZCodeTransport } from "./transport.js";
+
+/**
+ * A ProviderPrompt carries a delivery mode and a content array. There is no
+ * `text` field.
+ */
+function textPrompt(clientMessageId: string, text: string): ProviderPrompt {
+  return {
+    clientMessageId,
+    delivery: "auto",
+    input: { type: "message", content: [{ type: "text", text }] },
+  };
+}
 
 function fakeTransport() {
   const sent: Array<{ method: string; params: unknown }> = [];
@@ -1446,7 +1820,7 @@ describe("ZCode session turn state", () => {
       emit: (event) => events.push(event),
     });
     await session.open({ cwd: "/w" });
-    await session.prompt({ clientMessageId: "m1", text: "hello" });
+    await session.prompt(textPrompt("m1", "hello"));
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "session.prompt_result",
@@ -1464,7 +1838,7 @@ describe("ZCode session turn state", () => {
       emit: () => undefined,
     });
     await session.open({ cwd: "/w" });
-    await session.prompt({ clientMessageId: "m1", text: "hello" });
+    await session.prompt(textPrompt("m1", "hello"));
     const first = session.interrupt();
     const second = session.interrupt();
     await Promise.all([first, second]);
@@ -1479,11 +1853,9 @@ describe("ZCode session turn state", () => {
       emit: () => undefined,
     });
     await session.open({ cwd: "/w" });
-    await session.prompt({ clientMessageId: "m1", text: "hello" });
+    await session.prompt(textPrompt("m1", "hello"));
     void session.interrupt();
-    await expect(session.prompt({ clientMessageId: "m2", text: "again" })).rejects.toThrow(
-      /cancel/i,
-    );
+    await expect(session.prompt(textPrompt("m2", "again"))).rejects.toThrow(/cancel/i);
   });
 
   test("a failed cancel keeps refusing new prompts", async () => {
@@ -1497,11 +1869,52 @@ describe("ZCode session turn state", () => {
       emit: () => undefined,
     });
     await session.open({ cwd: "/w" });
-    await session.prompt({ clientMessageId: "m1", text: "hello" });
+    await session.prompt(textPrompt("m1", "hello"));
     await expect(session.interrupt()).rejects.toThrow("stop failed");
-    await expect(session.prompt({ clientMessageId: "m2", text: "again" })).rejects.toThrow(
-      /cancel/i,
-    );
+    await expect(session.prompt(textPrompt("m2", "again"))).rejects.toThrow(/cancel/i);
+  });
+
+  test("attributes each turn's completion to the turn that started it", async () => {
+    const harness = fakeTransport();
+    const events: ProviderEvent[] = [];
+    const session = new ZCodeSession({
+      id: "paseo-1",
+      transport: harness.transport,
+      emit: (event) => events.push(event),
+    });
+    await session.open({ cwd: "/w" });
+    await session.prompt(textPrompt("m1", "first"));
+    await session.prompt(textPrompt("m2", "second"));
+
+    harness.emit({
+      type: "turn.started",
+      sessionId: "zcode-1",
+      turnId: "native-1",
+      seq: 1,
+      payload: { inputId: "paseo-input-m1" },
+    });
+    harness.emit({
+      type: "turn.started",
+      sessionId: "zcode-1",
+      turnId: "native-2",
+      seq: 2,
+      payload: { inputId: "paseo-input-m2" },
+    });
+    harness.emit({
+      type: "turn.completed",
+      sessionId: "zcode-1",
+      turnId: "native-1",
+      seq: 3,
+      payload: {},
+    });
+
+    const turns = events.filter((event) => event.type === "session.turn");
+    const started = turns.filter((event) => event.state === "started");
+    const completed = turns.filter((event) => event.state === "completed");
+    expect(started).toHaveLength(2);
+    expect(started[0]!.turnId).not.toBe(started[1]!.turnId);
+    expect(completed).toHaveLength(1);
+    expect(completed[0]!.turnId).toBe(started[0]!.turnId);
   });
 });
 ```
@@ -1535,8 +1948,16 @@ export interface ZCodeSessionOptions {
 
 export class ZCodeSession {
   private phase: TurnPhase = "idle";
-  private active: ActiveTurn | undefined;
-  private currentTurnId = "zcode-turn-0";
+  /**
+   * Turns are tracked per input id, not in a single slot. A second prompt can
+   * be dispatched while the first turn is still running, and a single slot
+   * would attribute the first turn's completion to the second turn.
+   */
+  private readonly turns = new Map<string, ActiveTurn>();
+  /** ZCode's own turn id to the Paseo turn id it corresponds to. */
+  private readonly nativeTurnIds = new Map<string, string>();
+  /** The most recently started turn, used when an event carries no usable id. */
+  private activeTurnId: string | undefined;
   private nativeSessionId = "";
   private cancelInFlight: Promise<void> | undefined;
   private readonly unsubscribe: () => void;
@@ -1575,6 +1996,16 @@ export class ZCodeSession {
     if (prompt.input.type === "command") {
       throw new Error("Slash commands are not supported on the legacy ZCode transport");
     }
+    const unsupported = prompt.input.content.filter((part) => part.type !== "text");
+    if (unsupported.length > 0) {
+      // The daemon gates images behind prompt.image, which this transport does
+      // not declare, so an image prompt never arrives. Attachments have no
+      // capability gate, so the session rejects them itself. Dropping them
+      // would run the turn without the content the user attached.
+      throw new Error(
+        `Attachments are not supported on the legacy ZCode transport: ${unsupported.map((part) => part.type).join(", ")}`,
+      );
+    }
     const text = prompt.input.content
       .filter((part): part is { type: "text"; text: string } => part.type === "text")
       .map((part) => part.text)
@@ -1582,8 +2013,7 @@ export class ZCodeSession {
     const turnId = `zcode-turn-${this.options.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const inputId = `paseo-input-${prompt.clientMessageId}`;
     this.phase = "running";
-    this.currentTurnId = turnId;
-    this.active = { turnId, inputId, clientMessageId: prompt.clientMessageId };
+    this.turns.set(inputId, { turnId, inputId, clientMessageId: prompt.clientMessageId });
     await this.options.transport.send({
       sessionId: this.nativeSessionId,
       content: text,
@@ -1599,6 +2029,7 @@ export class ZCodeSession {
 
   interrupt(): Promise<void> {
     if (this.cancelInFlight) return this.cancelInFlight;
+    const cancelledTurnId = this.activeTurnId;
     this.phase = "stopping";
     this.cancelInFlight = this.options.transport
       .stop({ sessionId: this.nativeSessionId })
@@ -1611,7 +2042,7 @@ export class ZCodeSession {
         this.options.emit({
           type: "session.turn",
           sessionId: this.options.id,
-          turnId: this.currentTurnId,
+          turnId: cancelledTurnId ?? "zcode-turn-unknown",
           state: "failed",
           error: { message: error instanceof Error ? error.message : String(error) },
         });
@@ -1623,11 +2054,14 @@ export class ZCodeSession {
   private handleEvent(event: ZCodeEvent): void {
     if (event.type === "turn.started") {
       const payload = event.payload as { inputId?: string } | undefined;
-      if (payload?.inputId && payload.inputId === this.active?.inputId) {
+      const turn = payload?.inputId ? this.turns.get(payload.inputId) : undefined;
+      if (turn) {
+        if (event.turnId) this.nativeTurnIds.set(event.turnId, turn.turnId);
+        this.activeTurnId = turn.turnId;
         this.options.emit({
           type: "session.turn",
           sessionId: this.options.id,
-          turnId: this.currentTurnId,
+          turnId: turn.turnId,
           state: "started",
         });
       }
@@ -1635,14 +2069,23 @@ export class ZCodeSession {
     }
     if (event.type === "turn.completed" || event.type === "turn.failed") {
       if (this.phase === "stopping") return;
-      this.phase = "idle";
+      const turnId =
+        (event.turnId ? this.nativeTurnIds.get(event.turnId) : undefined) ??
+        this.activeTurnId ??
+        [...this.turns.values()].at(-1)?.turnId;
+      if (!turnId) return;
+      if (event.turnId) this.nativeTurnIds.delete(event.turnId);
+      for (const [key, value] of this.turns) {
+        if (value.turnId === turnId) this.turns.delete(key);
+      }
+      this.phase = this.turns.size > 0 ? "running" : "idle";
+      if (this.activeTurnId === turnId) this.activeTurnId = undefined;
       this.options.emit({
         type: "session.turn",
         sessionId: this.options.id,
-        turnId: this.currentTurnId,
+        turnId,
         state: event.type === "turn.completed" ? "completed" : "failed",
       });
-      this.active = undefined;
     }
   }
 
@@ -1728,7 +2171,34 @@ describe("ZCode timeline mapping", () => {
       seq: 3,
       payload: { toolCallId: "t1", toolName: "read_file", kind: "read", input: { path: "/a" } },
     });
-    expect(items[0]).toMatchObject({ type: "tool_call", callId: "t1", name: "read_file" });
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      callId: "t1",
+      name: "read_file",
+      status: "running",
+      error: null,
+      detail: { type: "read", filePath: "/a" },
+    });
+  });
+
+  test("maps a failed tool call", () => {
+    const items = mapEventToTimelineItems({
+      type: "tool.updated",
+      sessionId: "s1",
+      seq: 5,
+      payload: {
+        toolCallId: "t2",
+        toolName: "bash",
+        status: "failed",
+        input: { command: "ls" },
+      },
+    });
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      callId: "t2",
+      status: "failed",
+      detail: { type: "shell", command: "ls" },
+    });
   });
 
   test("returns nothing for an event it does not map", () => {
@@ -1822,7 +2292,10 @@ Expected: FAIL with "Cannot find module".
 Create `plugins/zcode-provider/server/internal/timeline.ts`:
 
 ```ts
-import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
+import type {
+  ProviderTimelineItem,
+  ProviderToolCallDetail,
+} from "@getpaseo/plugin/server/provider";
 import type { ZCodeEvent } from "./transport.js";
 
 interface EventPayload {
@@ -1865,36 +2338,49 @@ export function mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem
   }
   if (event.type === "tool.updated") {
     const callId = payload.toolCallId ?? `${event.sessionId}-${event.seq}`;
+    const name = payload.toolName ?? "tool";
+    const detail = toolDetailFor(payload.input);
+    // A tool call is a discriminated union: `error` is null for every status
+    // except `failed`. Compute the status and the error together, or the
+    // object literal satisfies neither branch.
+    if (payload.status === "failed") {
+      return [
+        {
+          id: callId,
+          type: "tool_call",
+          callId,
+          name,
+          status: "failed",
+          error: { message: "tool failed" },
+          detail,
+        },
+      ];
+    }
     const status =
-      payload.status === "failed"
-        ? "failed"
-        : payload.status === "canceled"
-          ? "canceled"
+      payload.status === "canceled" || payload.status === "cancelled"
+        ? "canceled"
+        : payload.status === "completed" || payload.status === "success"
+          ? "completed"
           : "running";
-    return [
-      {
-        id: callId,
-        type: "tool_call",
-        callId,
-        name: payload.toolName ?? "tool",
-        status,
-        error: status === "failed" ? { message: "tool failed" } : null,
-        detail: { type: "shell", command: describeToolInput(payload.input) },
-      },
-    ];
+    return [{ id: callId, type: "tool_call", callId, name, status, error: null, detail }];
   }
   return [];
 }
 
-function describeToolInput(input: unknown): string {
-  if (input && typeof input === "object") {
-    const record = input as Record<string, unknown>;
-    for (const key of ["command", "filePath", "path", "query"]) {
-      const value = record[key];
-      if (typeof value === "string") return value;
-    }
-  }
-  return "";
+/**
+ * ZCode reports a tool call as a name and an opaque input object. Pick the
+ * detail variant that matches the input, so the client renders a file read
+ * as a file read instead of a shell command.
+ */
+function toolDetailFor(input: unknown): ProviderToolCallDetail {
+  const record = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const command = record.command;
+  if (typeof command === "string") return { type: "shell", command };
+  const filePath = record.filePath ?? record.path;
+  if (typeof filePath === "string") return { type: "read", filePath };
+  const query = record.query;
+  if (typeof query === "string") return { type: "search", query };
+  return { type: "shell", command: "" };
 }
 ```
 
@@ -2025,35 +2511,55 @@ import { describe, expect, test } from "vitest";
 import { mapCatalog } from "./catalog.js";
 
 describe("ZCode catalog mapping", () => {
-  test("maps models and modes from the session snapshot", () => {
-    const catalog = mapCatalog({
-      configOptions: {
-        model: {
-          current: "glm-5",
-          options: [
-            { id: "glm-5", name: "GLM 5" },
-            { id: "glm-4", name: "GLM 4" },
-          ],
-        },
-        mode: {
-          current: "plan",
-          options: [
-            { id: "plan", name: "Plan" },
-            { id: "build", name: "Build" },
-          ],
-        },
+  test("maps models, modes and thought levels from the config options", () => {
+    const catalog = mapCatalog([
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "glm-5",
+        options: [
+          { value: "glm-5", name: "GLM 5" },
+          { value: "glm-4", name: "GLM 4" },
+        ],
       },
-    });
+      {
+        id: "mode",
+        name: "Mode",
+        category: "mode",
+        type: "select",
+        currentValue: "plan",
+        options: [
+          { value: "plan", name: "Plan" },
+          { value: "build", name: "Build" },
+        ],
+      },
+      {
+        id: "thought_level",
+        name: "Thought level",
+        category: "thought_level",
+        type: "select",
+        currentValue: "high",
+        options: [{ value: "high", name: "High" }],
+      },
+    ]);
     expect(catalog.models.map((model) => model.id)).toEqual(["glm-5", "glm-4"]);
     expect(catalog.modes.map((mode) => mode.id)).toEqual(["plan", "build"]);
+    expect(catalog.thinkingOptions?.map((option) => option.id)).toEqual(["high"]);
+    expect(catalog.defaultModel).toBe("glm-5");
+    expect(catalog.defaultMode).toBe("plan");
+    expect(catalog.defaultThinkingOption).toBe("high");
   });
 
-  test("returns an empty catalog for a snapshot without options", () => {
-    expect(mapCatalog({}).models).toEqual([]);
-    expect(mapCatalog({}).modes).toEqual([]);
+  test("returns an empty catalog when there are no config options", () => {
+    expect(mapCatalog([]).models).toEqual([]);
+    expect(mapCatalog([]).modes).toEqual([]);
   });
 });
 ```
+
+ZCode projects its model, mode and thought-level options from session settings and returns them on a session snapshot, as a flat array of config options discriminated by `category` (`packages/shared/src/zcode-task-types-core.ts:392-402` in the ZCode repository). Each option carries `currentValue` for the selected value and an `options` array of `{ value, name }` entries. There is no nested `configOptions.model` object.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2067,39 +2573,51 @@ Create `plugins/zcode-provider/server/internal/catalog.ts`:
 ```ts
 import type { ProviderCatalog } from "@getpaseo/plugin/server/provider";
 
-interface OptionGroup {
-  current?: string;
-  options?: Array<{ id: string; name?: string; label?: string }>;
+/**
+ * ZCode's config options, as they arrive on a session snapshot
+ * (`packages/shared/src/zcode-task-types-core.ts:392-402` in the ZCode
+ * repository). The array is flat; `category` says what each option configures.
+ */
+export interface ZCodeConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  /** "mode" | "model" | "thought_level", or a custom category. */
+  category?: string;
+  type: "select" | "boolean";
+  currentValue: string | boolean;
+  options?: Array<{ value: string; name: string; description?: string }>;
 }
 
-interface Snapshot {
-  configOptions?: {
-    model?: OptionGroup;
-    mode?: OptionGroup;
-    thoughtLevel?: OptionGroup;
+export function mapCatalog(configOptions: readonly ZCodeConfigOption[]): ProviderCatalog {
+  const inCategory = (category: string) =>
+    configOptions.filter((option) => option.category === category);
+
+  const entries = (category: string) =>
+    inCategory(category).flatMap((option) =>
+      (option.options ?? []).map((entry) => ({
+        id: entry.value,
+        label: entry.name,
+        ...(option.description ? { description: option.description } : {}),
+      })),
+    );
+
+  const current = (category: string) => {
+    const option = inCategory(category)[0];
+    return typeof option?.currentValue === "string" ? option.currentValue : undefined;
   };
-}
 
-export function mapCatalog(snapshot: Snapshot): ProviderCatalog {
-  const options = snapshot.configOptions;
-  const models = (options?.model?.options ?? []).map((option) => ({
-    id: option.id,
-    label: option.name ?? option.label ?? option.id,
-  }));
-  const modes = (options?.mode?.options ?? []).map((option) => ({
-    id: option.id,
-    label: option.name ?? option.label ?? option.id,
-  }));
+  const defaultModel = current("model");
+  const defaultMode = current("mode");
+  const defaultThinkingOption = current("thought_level");
+
   return {
-    models,
-    modes,
-    thinkingOptions: (options?.thoughtLevel?.options ?? []).map((option) => ({
-      id: option.id,
-      label: option.name ?? option.label ?? option.id,
-    })),
-    defaultModel: options?.model?.current,
-    defaultMode: options?.mode?.current,
-    defaultThinkingOption: options?.thoughtLevel?.current,
+    models: entries("model"),
+    modes: entries("mode"),
+    thinkingOptions: entries("thought_level"),
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultMode ? { defaultMode } : {}),
+    ...(defaultThinkingOption ? { defaultThinkingOption } : {}),
   };
 }
 ```
@@ -2133,14 +2651,15 @@ function createConnection(
   /**
    * Paseo and ZCode name sessions differently. The persistence handle carries
    * the ZCode id, and the archive and unarchive inputs carry only that handle,
-   * so the connection indexes both directions.
+   * so the connection indexes both directions. The index outlives a closed
+   * session, because an agent is closed before it is archived.
    */
   const nativeIndex = new Map<string, string>();
 
-  function paseoSessionForNative(nativeId: string): ZCodeSession {
+  function paseoIdForNative(nativeId: string): string {
     const paseoId = nativeIndex.get(nativeId);
     if (!paseoId) throw new ZCodeError(`Unknown ZCode session: ${nativeId}`);
-    return session(paseoId);
+    return paseoId;
   }
 
   function ensureTransport(): ZCodeTransport {
@@ -2155,8 +2674,11 @@ function createConnection(
   async function dispatch(input: ProviderInput): Promise<void> {
     switch (input.type) {
       case "catalog": {
-        const snapshot = (await ensureTransport().rpc.call("session/read", {})) as unknown;
-        emit({ type: "catalog", requestId: input.requestId, catalog: mapCatalog(snapshot) });
+        emit({
+          type: "catalog",
+          requestId: input.requestId,
+          catalog: await readCatalog(input.cwd),
+        });
         return;
       }
       case "sessions": {
@@ -2216,17 +2738,17 @@ function createConnection(
       }
       case "session.archive": {
         const nativeId = nativeSessionIdOf(input.persistence);
-        await paseoSessionForNative(nativeId).archive();
+        await ensureTransport().archive({ sessionId: nativeId });
         emit({
           type: "session.persistence",
-          sessionId: nativeId,
+          sessionId: paseoIdForNative(nativeId),
           persistence: input.persistence,
         });
         return;
       }
       case "session.unarchive": {
         const nativeId = nativeSessionIdOf(input.persistence);
-        await paseoSessionForNative(nativeId).unarchive(input.persistence);
+        await ensureTransport().resumeSession({ sessionId: nativeId });
         return;
       }
       case "session.can_stop_runtime": {
@@ -2364,11 +2886,9 @@ async answerPermission(permissionId: string, response: ProviderPermissionRespons
 async archive(): Promise<void> {
   await this.options.transport.archive({ sessionId: this.nativeSessionId });
 }
-
-async unarchive(_persistence: ProviderPersistence): Promise<void> {
-  await this.options.transport.resumeSession({ sessionId: this.nativeSessionId });
-}
 ```
+
+Archive and unarchive are not session-scoped operations. The daemon restores an archived agent by calling `unarchiveNativeSession` _before_ it opens the session, so no live `ZCodeSession` exists at that moment. The connection therefore drives the transport directly with the ZCode id carried by the persistence handle, and never looks up a live session for either case.
 
 `permissionRequests` is a `Map<string, ProviderPermissionRequest>` on the session. The session's event handler fills it when a `permission.requested` event arrives:
 
@@ -2381,16 +2901,59 @@ if (event.type === "permission.requested") {
 }
 ```
 
-`archive` is added to `ZCodeTransport` and to the legacy transport:
+`archive` and `readSnapshot` are added to `ZCodeTransport` and to the legacy transport:
 
 ```ts
 // In ZCodeTransport:
 archive(input: { sessionId: string }): Promise<void>;
+readSnapshot(input: { sessionId: string }): Promise<{ configOptions?: ZCodeConfigOption[] }>;
 
 // In the legacy transport:
 async archive(input) {
   await process.rpc.call("session/close", { sessionId: input.sessionId });
 },
+async readSnapshot(input) {
+  const snapshot = (await process.rpc.call("session/read", {
+    sessionId: input.sessionId,
+  })) as { configOptions?: ZCodeConfigOption[] };
+  return { configOptions: snapshot?.configOptions ?? [] };
+},
+```
+
+`session/read` requires a `sessionId`, and ZCode returns its config options on a session snapshot. The catalog is therefore read through a session the provider opens for the request:
+
+```ts
+/**
+ * ZCode projects its model, mode and thought-level options from session
+ * settings and returns them on a session snapshot. `session/read` requires a
+ * session id, so the provider opens a session for the request, reads the
+ * snapshot, and closes the session again.
+ */
+async function readCatalog(cwd: string | undefined): Promise<ProviderCatalog> {
+  const workspacePath = cwd ?? process.cwd();
+  const handle = await ensureTransport().createSession({
+    workspace: { workspacePath, workspaceKey: workspacePath },
+  });
+  try {
+    const snapshot = await ensureTransport().readSnapshot({ sessionId: handle.sessionId });
+    return mapCatalog(snapshot.configOptions ?? []);
+  } finally {
+    await ensureTransport().archive({ sessionId: handle.sessionId });
+  }
+}
+```
+
+The `catalog` input becomes:
+
+```ts
+case "catalog": {
+  emit({
+    type: "catalog",
+    requestId: input.requestId,
+    catalog: await readCatalog(input.cwd),
+  });
+  return;
+}
 ```
 
 `toSessionSummary` converts a ZCode session entry into a `ProviderSessionSummary`, which is `{ persistence, cwd, title?, description?, updatedAt? }`:
@@ -2447,14 +3010,26 @@ void ensureTransportProcess().ready.catch((error) => {
 });
 ```
 
-`ensureTransport` therefore keeps the `ZCodeProcess` next to the transport, not just the transport:
+`ensureTransport` therefore keeps the `ZCodeProcess` next to the transport, not just the transport. Replace the earlier `ensureTransport` with this pair:
 
 ```ts
 let child: ZCodeProcess | undefined;
 
+/**
+ * The bundled JavaScript runtime is an Electron app bundle. It only runs as
+ * Node when ELECTRON_RUN_AS_NODE is set, and only the bundled runtime needs
+ * it. The check reads the launch the daemon handed us, not the resolution
+ * the plugin proposed, because a user override can replace the command.
+ */
+function childEnv(): Record<string, string> {
+  const env = { ...launch.env };
+  if (launch.args[0]?.endsWith(".cjs")) env.ELECTRON_RUN_AS_NODE = "1";
+  return env;
+}
+
 function ensureTransportProcess(): ZCodeProcess {
   if (!child) {
-    child = startZCodeProcess({ command: launch.command, args: launch.args, env: launch.env });
+    child = startZCodeProcess({ command: launch.command, args: launch.args, env: childEnv() });
     transport = createLegacyTransport(child);
   }
   return child;
@@ -2485,7 +3060,7 @@ describe("ZCode provider", () => {
       launch: {
         command: process.execPath,
         args: [fakeServer],
-        env: { FAKE_ZCODE_MODE: "ok" },
+        env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
       },
       versions: [1],
       capabilities: ["prompt.message", "session.persistence"],
@@ -2501,7 +3076,7 @@ describe("ZCode provider", () => {
       launch: {
         command: process.execPath,
         args: [fakeServer],
-        env: { FAKE_ZCODE_MODE: "ok" },
+        env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
       },
       versions: [1],
       capabilities: ["prompt.message"],
@@ -2648,7 +3223,7 @@ Create `plugins/zcode-provider/server/provider.e2e.test.ts`:
 
 ```ts
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ProviderEvent, ProviderInput } from "@getpaseo/plugin/server/provider";
 import { createZCodeProvider } from "./provider.js";
 
@@ -2661,7 +3236,7 @@ describe("ZCode provider end to end", () => {
       launch: {
         command: process.execPath,
         args: [fakeServer],
-        env: { FAKE_ZCODE_MODE: "ok" },
+        env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
       },
       versions: [1],
       capabilities: ["prompt.message", "session.persistence"],
@@ -2669,7 +3244,7 @@ describe("ZCode provider end to end", () => {
     const events: ProviderEvent[] = [];
     connection.onEvent((event) => events.push(event));
 
-    connection.send({
+    await connection.send({
       type: "session.open",
       requestId: "r1",
       sessionId: "p1",
@@ -2680,7 +3255,7 @@ describe("ZCode provider end to end", () => {
       expect(events.some((event) => event.type === "session.ready")).toBe(true);
     });
 
-    connection.send({
+    await connection.send({
       type: "session.prompt",
       sessionId: "p1",
       prompt: {
@@ -2729,15 +3304,17 @@ if (
 }
 ```
 
-`turn.completed` carries `tokenCount`, which becomes usage. Add to the same handler:
+`turn.completed` carries `tokenCount`, which becomes usage. Add this branch to `handleEvent`, **before** the branch that handles `turn.completed` for the turn state, because that branch clears the native turn id this one reads:
 
 ```ts
 if (event.type === "turn.completed") {
   const payload = event.payload as { tokenCount?: number } | undefined;
+  const turnId =
+    (event.turnId ? this.nativeTurnIds.get(event.turnId) : undefined) ?? this.activeTurnId;
   this.options.emit({
     type: "session.usage",
     sessionId: this.options.id,
-    turnId: this.currentTurnId,
+    ...(turnId ? { turnId } : {}),
     usage: { inputTokens: payload?.tokenCount, outputTokens: 0 },
   });
 }
@@ -2771,7 +3348,7 @@ The V4 transport is a separate plan and is deliberately not part of this one. It
 Its entry criteria are met once this plan lands:
 
 - The `ZCodeTransport` interface in `plugins/zcode-provider/server/internal/transport.ts` is the seam the V4 transport implements. It already exists, so the V4 work does not touch the legacy transport, the session state machine, the timeline mapper, the permission mapper, or the connection wiring.
-- The capability list changes in exactly one place. `ZCODE_CAPABILITIES` in `plugins/zcode-provider/server/provider.ts` gains `session.revert.conversation`, `session.revert.files`, `session.revert.both` and `prompt.steer`, and the transport's own `capabilities` becomes the authority so the two transports differ without touching the connection.
+- The capability list changes in exactly one place. `ZCODE_CAPABILITIES` in `plugins/zcode-provider/server/capabilities.ts` gains `session.revert.conversation`, `session.revert.files`, `session.revert.both` and `prompt.steer`, and the transport's own `capabilities` becomes the authority so the two transports differ without touching the connection.
 - `PASEO_ZCODE_PROTOCOL` selects the transport. It reads `auto`, `legacy` or `v4` from the environment, with `auto` meaning "use the V4 transport when the CLI reports support for it, otherwise the legacy transport".
 
 The V4 plan has to cover: topic subscription and the snapshot-plus-delta read model, the sequence and log-epoch watermarks, gap detection and resync, the CAS command envelope and its `baseRevision`, the six acknowledgement states, `applyFileRewind` and `editUserQuery` for rewind, the queue commands for steer, and the transport selection probe.

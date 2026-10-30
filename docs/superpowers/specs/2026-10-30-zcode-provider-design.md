@@ -268,8 +268,8 @@ Because events arrive by polling, the acknowledgment and the turn start land one
 | Capability                                       | Legacy | V4  | Note                                                            |
 | ------------------------------------------------ | ------ | --- | --------------------------------------------------------------- |
 | `prompt.message`                                 | yes    | yes |                                                                 |
-| `prompt.command`                                 | yes    | yes | `available_commands_update` to `session.commands`               |
-| `prompt.image`                                   | yes    | yes | attachments                                                     |
+| `prompt.command`                                 | P2     | yes | `available_commands_update` to `session.commands`               |
+| `prompt.image`                                   | P2     | yes | attachments                                                     |
 | `prompt.steer`                                   | no     | yes | `session/steer` is a deleted word; V4 queue commands replace it |
 | `prompt.output_schema`                           | no     | no  | ZCode has no structured output concept                          |
 | `session.configure`                              | yes    | yes | model, mode, thought level                                      |
@@ -282,6 +282,8 @@ Because events arrive by polling, the acknowledgment and the turn start land one
 | `permission`                                     | yes    | yes |                                                                 |
 | `permission.tool_policy`                         | yes    | yes | via `permissionUpdates`                                         |
 | `timeline.plugin`                                | yes    | yes |                                                                 |
+
+The legacy transport's P1 scope carries text only. `prompt.command` and `prompt.image` land in P2, because the daemon routes a prompt to the provider whenever the negotiated capability set allows it: declaring a capability the legacy transport cannot honour turns a clean rejection into a runtime failure, and dropping an image silently loses the user's content. Until P2, the legacy provider declares neither and rejects a command or a non-text part outright.
 
 ### 5.6 Stop boundary
 
@@ -353,7 +355,7 @@ Lands as its own PR.
 
 ### P1 — Legacy transport and the core loop (1.5 weeks)
 
-`LegacyTransport` covering NDJSON framing, requests, responses, event dispatch and process lifecycle; the mapping layer covering turn state, timeline projection and turn correlation; capabilities `prompt.message`, `prompt.command`, `prompt.image`, `permission`, `permission.tool_policy`, `session.configure`, `session.list`, `session.persistence`, `session.archive`, `session.unarchive`, `session.can_stop_runtime`, `session.subsession`, `timeline.plugin`.
+`LegacyTransport` covering NDJSON framing, requests, responses, event dispatch and process lifecycle; the mapping layer covering turn state, timeline projection and turn correlation; capabilities `prompt.message`, `permission`, `permission.tool_policy`, `session.configure`, `session.list`, `session.persistence`, `session.archive`, `session.unarchive`, `session.can_stop_runtime`, `session.subsession`, `timeline.plugin`. `prompt.command` and `prompt.image` arrive with P2, when the wire format for them exists.
 
 ### P2 — Remaining parity work (1 week)
 
