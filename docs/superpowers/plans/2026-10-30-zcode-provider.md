@@ -3326,8 +3326,68 @@ describe("ZCode provider", () => {
     });
     await connection.close();
   });
+
+  test("answers the permission ZCode asks for with a reverse request", async () => {
+    const provider = createZCodeProvider();
+    const connection = await provider.connect({
+      launch: {
+        command: process.execPath,
+        args: [fakeServer],
+        env: { ...process.env, FAKE_ZCODE_MODE: "ok" },
+      },
+      versions: [1],
+      capabilities: ["prompt.message", "permission"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "p1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    } as ProviderInput);
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session.ready")).toBe(true);
+    });
+
+    // The fake app-server sends the permission as a reverse request and waits
+    // for the answer on that request.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "p1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    } as ProviderInput);
+
+    await vi.waitFor(() => {
+      const permission = events.find((event) => event.type === "session.permission");
+      expect(permission).toBeDefined();
+    });
+    const permission = events.find((event) => event.type === "session.permission") as
+      | Extract<ProviderEvent, { type: "session.permission" }>
+      | undefined;
+    expect(permission?.request.actions.map((action) => action.id)).toEqual(["allow", "deny"]);
+
+    await connection.send({
+      type: "session.permission",
+      sessionId: "p1",
+      permissionId: permission!.request.id,
+      response: { behavior: "allow", selectedActionId: "allow" },
+    } as ProviderInput);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session.permission_resolved")).toBe(true);
+    });
+    await connection.close();
+  });
 });
 ```
+
+The fake app-server has to send the permission as a reverse request — a frame with an `id` and a `method` — and wait for that frame's answer. It is the answer to that request that releases ZCode, so the fake cannot move on until it receives one.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
