@@ -3011,6 +3011,18 @@ function createConnection(
 }
 ```
 
+The registration also gains a catalog cache key. The legacy catalog comes from a ZCode session, and building it means opening one, so the daemon has to cache it:
+
+```ts
+async getCatalogCacheKey(options) {
+  const launch = options.launch;
+  if (!launch) return undefined;
+  // The catalog depends on the executable and on the workspace whose settings
+  // ZCode projects the options from.
+  return `${launch.command}\u0000${options.cwd ?? ""}`;
+}
+```
+
 The `connect` implementation becomes:
 
 ```ts
