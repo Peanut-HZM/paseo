@@ -2107,7 +2107,14 @@ export class ZCodeSession {
       capabilities: this.options.transport.capabilities,
       restoration: "core",
       cwd: input.cwd,
-      persistence: { version: 1, data: { nativeSessionId: handle.sessionId } },
+      persistence: {
+        version: 1,
+        data: {
+          nativeSessionId: handle.sessionId,
+          workspaceKey: handle.workspace.workspaceKey,
+          workspacePath: handle.workspace.workspacePath,
+        },
+      },
     });
     this.options.emit({ type: "session.ready", sessionId: this.options.id });
     return handle.sessionId;
