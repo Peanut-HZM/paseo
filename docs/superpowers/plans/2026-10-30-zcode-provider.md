@@ -1072,9 +1072,9 @@ git commit -m "feat(plugins): decode ZCode frames without mirroring their strict
 
 **Interfaces:**
 
-- Consumes: `decodeFrame`, `encodeRequest`, `ZCodeError` from Task 3.
+- Consumes: `decodeFrame`, `encodeRequest`, `encodeResponse`, `encodeError`, `ZCodeError`, `ZCodeEventFrame`, `ZCodeRequestFrame` from Task 3.
 - Produces:
-  - `class ZCodeRpcClient` with `call(method, params): Promise<unknown>`, `onEvent(listener): () => void`, `write(line: string): void`, `close(): void`.
+  - `class ZCodeRpcClient` with `call(method, params): Promise<unknown>`, `onEvent(listener): () => void`, `onRequest(listener): () => void`, `write(line: string): void`, `close(): void`.
   - `isMethodNotFound(error): boolean` — a standalone export, not a static member.
 
 - [ ] **Step 1: Write the failing test**
