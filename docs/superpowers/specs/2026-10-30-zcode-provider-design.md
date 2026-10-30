@@ -203,6 +203,10 @@ The persistence handle is `{ version: 1, data: { nativeSessionId, workspaceKey, 
 
 ### 5.2 Outputs
 
+**Legacy delivers events by cursor, not by push.** `session/events` takes `{ sessionId, afterSeq?, limit? }` and returns the events after that sequence number; every event carries `seq` in its envelope (`packages/shared/src/zcode-protocol/index.ts:1395-1405`). `session/subscribe` is a replay, not a live stream: it returns `{ eventSeq, events, sessionId, snapshot? }` and only marks the session as having a subscriber for residency accounting (`apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts:1984-2009`). There is no unsubscribe RPC.
+
+The legacy transport therefore polls. Each session keeps a cursor, calls `session/events` on an interval, processes the returned events in sequence order, and advances the cursor. The poll interval sets the streaming latency, so the interval is short enough to feel immediate and long enough to stay cheap. The cost is one small request per active session per tick.
+
 | ZCode event                              | Payload highlights                                                                  | ProviderEvent                                                                         |
 | ---------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `turn.started`                           | `turnNumber`, `input`, `inputId`                                                    | `session.turn` with state `started`                                                   |
@@ -253,7 +257,11 @@ Paseo UI                 provider                ZCode CLI
    |  session.usage          |<-- tokenCount --------|
 ```
 
-`turn.started` carries `turnNumber` and `inputId` but no turn id, so the provider generates the turn id and sends the same `inputId` in `session/send`. The anchor is what keeps a queued or concurrent turn from being attributed to the wrong run.
+`turn.started` carries `turnNumber` and `inputId` in its payload, and the event envelope carries ZCode's own `turnId`. Neither can serve as the turn id Paseo needs at acknowledgment time, because `session/send` answers with `{ sessionId, accepted, stateRevision }` and no turn id (`packages/shared/src/zcode-protocol/index.ts:2155-2162`), while Paseo's `session.prompt_result` requires one in its `turn` variant (`packages/plugin/src/server/provider.ts:585-587`).
+
+The provider therefore generates its own turn id when it sends the prompt, and sends that same value as ZCode's `inputId`. When `turn.started` arrives, the echoed `inputId` tells the provider which of its turns this is, and the provider emits `session.turn` with its own turn id. The anchor is what keeps a queued or concurrent turn from being attributed to the wrong run.
+
+Because events arrive by polling, the acknowledgment and the turn start land one poll interval apart rather than immediately.
 
 ### 5.5 Capability matrix
 
@@ -405,7 +413,7 @@ ZCode handles its own authentication, so tests carry no auth checks, no environm
 
 ### P1
 
-- [ ] The first assistant text appears within three seconds of sending a prompt and then keeps growing incrementally.
+- [ ] The first assistant text appears within one second of ZCode producing it, and no later than two poll intervals after the prompt, and then keeps growing incrementally.
 - [ ] Tool calls render as tool calls with a name and a status, not as raw JSON.
 - [ ] A permission prompt appears, the user's decision releases the tool, and the turn completes.
 - [ ] Interrupting a running turn stops it and the turn ends in the `canceled` state.
