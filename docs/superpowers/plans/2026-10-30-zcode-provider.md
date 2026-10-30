@@ -2148,6 +2148,19 @@ export class ZCodeSession {
       .stop({ sessionId: this.nativeSessionId })
       .then(() => {
         this.cancelInFlight = undefined;
+        // The caller is owed a terminal. ZCode may or may not send one after
+        // a stop, so the provider emits the terminal itself and ignores the
+        // event that follows. The phase has to leave "stopping" too, or the
+        // session refuses every later prompt.
+        this.phase = "settled";
+        if (cancelledTurnId) {
+          this.options.emit({
+            type: "session.turn",
+            sessionId: this.options.id,
+            turnId: cancelledTurnId,
+            state: "canceled",
+          });
+        }
       })
       .catch((error) => {
         this.cancelInFlight = undefined;
@@ -2181,7 +2194,9 @@ export class ZCodeSession {
       return;
     }
     if (event.type === "turn.completed" || event.type === "turn.failed") {
-      if (this.phase === "stopping") return;
+      // A stopped turn already has its terminal: the provider emitted
+      // "canceled" when the cancel settled.
+      if (this.phase === "stopping" || this.phase === "settled") return;
       const turnId =
         (event.turnId ? this.nativeTurnIds.get(event.turnId) : undefined) ??
         this.activeTurnId ??
