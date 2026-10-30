@@ -2281,7 +2281,9 @@ runs."
 
 - Consumes: `ZCodeEvent` from Task 6.
 - Produces:
-  - `mapEventToTimelineItems(event: ZCodeEvent): ProviderTimelineItem[]`
+  - `mapEventToTimelineItems(event: ZCodeEvent, options?: TimelineMappingOptions): ProviderTimelineItem[]`
+  - `toolDetailFor(input: unknown): ProviderToolCallDetail`
+  - `TimelineMappingOptions` with an optional `toolDetails` map, so a tool call's detail survives from the `scheduled` variant to the later ones
   - `mapPermissionRequest(payload: unknown): ProviderPermissionRequest`
   - `permissionResponseFor(request: ProviderPermissionRequest, response: ProviderPermissionResponse): Record<string, JsonValue>`
 
@@ -2660,7 +2662,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add plugins/zcode-provider/server/internal/timeline.ts plugins/zcode-provider/server/internal/timeline.test.ts plugins/zcode-provider/server/internal/signals.ts plugins/zcode-provider/server/internal/signals.test.ts plugins/zcode-provider/server/internal/transport.ts plugins/zcode-provider/server/internal/legacy-transport.ts
+git add plugins/zcode-provider/server/internal/timeline.ts plugins/zcode-provider/server/internal/timeline.test.ts plugins/zcode-provider/server/internal/signals.ts plugins/zcode-provider/server/internal/signals.test.ts
 git commit -m "feat(plugins): map ZCode events to timeline items and permissions"
 ```
 
