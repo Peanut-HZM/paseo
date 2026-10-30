@@ -876,7 +876,10 @@ describe("ZCode frame decoding", () => {
         futureField: { anything: true },
       }),
     );
-    expect(frame).toMatchObject({ type: "message.upserted", sessionId: "s1", seq: 3 });
+    expect(frame).toMatchObject({
+      kind: "event",
+      event: { type: "message.upserted", sessionId: "s1", seq: 3 },
+    });
   });
 
   test("ignores an event type it does not know", () => {
@@ -1630,6 +1633,20 @@ import type {
 
 export const LEGACY_POLL_INTERVAL_MS = 200;
 
+/**
+ * ZCode's model picker value is "providerId/modelId", and the protocol wants
+ * the two parts separately (`packages/shared/src/model-selection.ts:34-44` in
+ * the ZCode repository). The catalog hands the provider the picker value as
+ * the model id, so this is the inverse of what the catalog produced.
+ */
+function toModelSelection(value: string): { providerId: string; modelId: string } {
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1) {
+    throw new Error(`ZCode model id is not a provider and model pair: ${value}`);
+  }
+  return { providerId: value.slice(0, separator), modelId: value.slice(separator + 1) };
+}
+
 export function createLegacyTransport(process: ZCodeProcess): ZCodeTransport {
   const cursors = new Map<string, number>();
   const listeners = new Set<(event: ZCodeEvent) => void>();
@@ -1695,7 +1712,7 @@ export function createLegacyTransport(process: ZCodeProcess): ZCodeTransport {
           workspaceKey: input.workspace.workspaceKey,
         },
         ...(input.mode ? { mode: input.mode } : {}),
-        ...(input.model ? { model: input.model } : {}),
+        ...(input.model ? { model: toModelSelection(input.model) } : {}),
         ...(input.thoughtLevel ? { thoughtLevel: input.thoughtLevel } : {}),
       })) as { sessionId?: string };
       if (!result?.sessionId) throw new Error("ZCode did not return a session id");
@@ -1736,7 +1753,7 @@ export function createLegacyTransport(process: ZCodeProcess): ZCodeTransport {
     async setModel(input) {
       await process.rpc.call("session/setModel", {
         sessionId: input.sessionId,
-        model: input.model,
+        model: toModelSelection(input.model),
       });
     },
     async setMode(input) {
