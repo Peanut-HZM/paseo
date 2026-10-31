@@ -13,6 +13,7 @@ import {
   type PluginClientBundleStore,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { ChunkedTransport } from "@getpaseo/protocol/chunked-transport";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
   decodeFileTransferFrame,
@@ -1102,6 +1103,7 @@ test("advertises client capabilities in hello", async () => {
       projected_subagent_timeline: true,
       reasoning_merge_enum: true,
       terminal_reflowable_snapshot: true,
+      terminal_chunked_replay: true,
       timeline_notifications: true,
       plugin_timeline_items: true,
       workspace_setup_blocked: true,
@@ -6388,66 +6390,80 @@ test("emits output events for the active terminal stream", async () => {
   unsubscribe();
 });
 
-test("emits snapshot events for the subscribed terminal stream", async () => {
-  const logger = createMockLogger();
-  const mock = createMockTransport();
+test.each([5, 500, 10000])(
+  "preserves explicit %s history demand on an old ANSI host and normalizes restore",
+  async (history) => {
+    const logger = createMockLogger();
+    const mock = createMockTransport();
 
-  const client = new DaemonClient({
-    url: "ws://test",
-    clientId: "clsk_unit_test",
-    logger,
-    reconnect: { enabled: false },
-    transportFactory: () => mock.transport,
-  });
-  clients.push(client);
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger,
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
 
-  const connectPromise = client.connect();
-  mock.triggerOpen();
-  await connectPromise;
+    const connectPromise = client.connect();
+    mock.triggerOpen();
+    await connectPromise;
 
-  const snapshots: unknown[] = [];
-  client.onTerminalStreamEvent((event) => {
-    if (event.type !== "snapshot") {
-      return;
-    }
-    snapshots.push(event.state);
-  });
+    const events: unknown[] = [];
+    const replayEvents: unknown[] = [];
+    client.onTerminalStreamEvent((event) => {
+      if (event.type === "replay") replayEvents.push(event.replay);
+      events.push(event);
+    });
 
-  const subscribePromise = client.subscribeTerminal("term-1", { requestId: "sub-2" });
-  await vi.waitFor(() =>
-    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
-  );
-  mock.triggerMessage(
-    wrapSessionMessage({
-      type: "subscribe_terminal_response",
-      payload: {
-        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
-        terminalId: "term-1",
+    const subscribePromise = client.subscribeTerminal("term-1", {
+      requestId: "sub-2",
+      restore: { mode: "visible-snapshot", scrollbackLines: history },
+    });
+    await vi.waitFor(() =>
+      expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+    );
+    expect(parseSentFrame(mock.sent.at(-1)).restore).toEqual({
+      mode: "visible-snapshot",
+      scrollbackLines: history,
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "subscribe_terminal_response",
+        payload: {
+          subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
+          terminalId: "term-1",
+          slot: 12,
+          error: null,
+          requestId: "sub-2",
+        },
+      }),
+    );
+    await subscribePromise;
+
+    const state = {
+      rows: 1,
+      cols: 5,
+      grid: [[{ char: "h" }, { char: "e" }, { char: "l" }, { char: "l" }, { char: "o" }]],
+      scrollback: [],
+      cursor: { row: 0, col: 5 },
+    };
+    mock.triggerMessage(
+      encodeTerminalStreamFrame({
+        opcode: TerminalStreamOpcode.Snapshot,
         slot: 12,
-        error: null,
-        requestId: "sub-2",
-      },
-    }),
-  );
-  await subscribePromise;
+        payload: encodeTerminalSnapshotPayload(state),
+      }),
+    );
 
-  const state = {
-    rows: 1,
-    cols: 5,
-    grid: [[{ char: "h" }, { char: "e" }, { char: "l" }, { char: "l" }, { char: "o" }]],
-    scrollback: [],
-    cursor: { row: 0, col: 5 },
-  };
-  mock.triggerMessage(
-    encodeTerminalStreamFrame({
-      opcode: TerminalStreamOpcode.Snapshot,
-      slot: 12,
-      payload: encodeTerminalSnapshotPayload(state),
-    }),
-  );
-
-  expect(snapshots).toEqual([state]);
-});
+    expect(events).toEqual([]);
+    const data = new TextEncoder().encode("\x1b[31mold ANSI host界🙂");
+    mock.triggerMessage(
+      encodeTerminalStreamFrame({ opcode: TerminalStreamOpcode.Restore, slot: 12, payload: data }),
+    );
+    expect(replayEvents).toEqual([{ type: "begin" }, { type: "data", data }, { type: "end" }]);
+  },
+);
 
 test("sends explicit terminal input and resize commands", async () => {
   const logger = createMockLogger();
@@ -6843,7 +6859,6 @@ test.each([false, true])(
     });
 
     const command = chunked ? "x".repeat(50 * 1024 * 1024) : "pwd";
-    const { ChunkedTransport } = await import("@getpaseo/protocol/chunked-transport");
     const sender = new ChunkedTransport({
       frameBytes: 24 * 1024 * 1024,
       send: (frame) => mock.triggerMessage(frame),
@@ -8483,6 +8498,133 @@ test("closes before admission when a protected-capable daemon is reached in lega
   expect(daemonReceived).toHaveLength(1);
   expect(JSON.parse(daemonReceived[0] as string)).toMatchObject({ type: "hello" });
 });
+
+test.each([
+  { chunked: false, transportChunked: false },
+  { chunked: true, transportChunked: false },
+  { chunked: false, transportChunked: true },
+  { chunked: true, transportChunked: true },
+])(
+  "default terminal observation requests ANSI replay (replay=$chunked, transport=$transportChunked)",
+  async ({ chunked, transportChunked }) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => transport.transport,
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({
+      preserveSent: true,
+      features: {
+        ownedSubscriptions: true,
+        "terminal-restore-modes": true,
+        binaryChunkingV1: transportChunked,
+      },
+    });
+    await connecting;
+    const hello = JSON.parse(transport.sent[0] as string);
+    expect(hello.capabilities[CLIENT_CAPS.terminalChunkedReplay]).toBe(true);
+    expect(hello.capabilities[CLIENT_CAPS.binaryChunkingV1]).toBe(true);
+    const wire: Uint8Array[] = [];
+    const sender = new ChunkedTransport({
+      frameBytes: 17,
+      send: (frame) => {
+        if (typeof frame === "string") throw new Error("Expected binary terminal frame");
+        wire.push(frame);
+        transport.triggerMessage(frame);
+      },
+      deliver: () => {},
+    });
+    sender.enabled = transportChunked;
+    const events: import("./terminal-stream-router").TerminalStreamEvent[] = [];
+    const observation = client.observeTerminal("default-terminal", (event) => events.push(event));
+    await vi.waitFor(() =>
+      expect(parseSentFrame(transport.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+    );
+    const request = parseSentFrame(transport.sent.at(-1));
+    expect(request.restore).toEqual({ mode: "full-snapshot" });
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "subscribe_terminal_response",
+        payload: {
+          terminalId: "default-terminal",
+          requestId: request.requestId,
+          subscriptionId: "default-subscription",
+          slot: 2,
+          error: null,
+        },
+      }),
+    );
+    await observation.ready;
+    const data = new TextEncoder().encode("\x1b[31mretained 界🙂\x1b[0m");
+    const metadata = { rows: 24, cols: 80, retainedHistoryLines: 1000 };
+    if (chunked) {
+      await sender.send(
+        encodeTerminalStreamFrame({
+          opcode: TerminalStreamOpcode.ReplayBegin,
+          slot: 2,
+          payload: JSON.stringify(metadata),
+        }),
+      );
+      await sender.send(
+        encodeTerminalStreamFrame({
+          opcode: TerminalStreamOpcode.ReplayData,
+          slot: 2,
+          payload: data,
+        }),
+      );
+      await sender.send(
+        encodeTerminalStreamFrame({ opcode: TerminalStreamOpcode.ReplayEnd, slot: 2 }),
+      );
+    } else {
+      // An ANSI-era host selects its existing Restore path for this explicit request.
+      await sender.send(
+        encodeTerminalStreamFrame({ opcode: TerminalStreamOpcode.Restore, slot: 2, payload: data }),
+      );
+    }
+    if (transportChunked) {
+      expect(wire.length).toBeGreaterThan(chunked ? 3 : 1);
+      expect(wire.some((frame) => frame[0] === 0x31)).toBe(true);
+      expect(wire.every((frame) => frame.length <= 17)).toBe(true);
+    } else {
+      expect(wire.map((frame) => frame[0])).toEqual(chunked ? [6, 7, 8] : [5]);
+    }
+    expect(events).toEqual([
+      {
+        terminalId: "default-terminal",
+        subscriptionId: "default-subscription",
+        type: "replay",
+        replay: chunked ? { type: "begin", ...metadata } : { type: "begin" },
+      },
+      {
+        terminalId: "default-terminal",
+        subscriptionId: "default-subscription",
+        type: "replay",
+        replay: { type: "data", data },
+      },
+      {
+        terminalId: "default-terminal",
+        subscriptionId: "default-subscription",
+        type: "replay",
+        replay: { type: "end" },
+      },
+    ]);
+    const live = new TextEncoder().encode("live after replay 界🙂");
+    await sender.send(
+      encodeTerminalStreamFrame({ opcode: TerminalStreamOpcode.Output, slot: 2, payload: live }),
+    );
+    expect(events.at(-1)).toEqual({
+      terminalId: "default-terminal",
+      subscriptionId: "default-subscription",
+      type: "output",
+      data: live,
+    });
+  },
+);
 
 test("uses the frame budget selected by an asynchronously opened transport", async () => {
   const mock = createMockTransport();
