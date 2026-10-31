@@ -10,6 +10,8 @@ import {
 } from "./colors";
 import { createNativeHeadlessTerminal } from "./headless-terminal-state";
 import { buildTerminalFrame } from "./terminal-frame";
+import { createNativeTerminalOutputDrain } from "./headless-terminal-output-drain";
+import { resolveMeasuredNativeTerminalSize } from "./terminal-size-measurement";
 
 const resolver = createTerminalCellStyleResolver(DEFAULT_TERMINAL_THEME);
 const RED = parseTerminalColor(DEFAULT_TERMINAL_THEME.red, 0);
@@ -196,4 +198,49 @@ describe("native terminal frame", () => {
 
     expect(actual).toEqual(graphemeRows);
   });
+});
+
+test("builds native frames after replay commits at captured geometry and the latest measurement precedes live text", async () => {
+  let measured = resolveMeasuredNativeTerminalSize({
+    layout: { width: 400, height: 240 },
+    metrics: { cellWidth: 10, cellHeight: 10 },
+  })!;
+  const terminal = createNativeHeadlessTerminal({ ...measured, scrollbackLines: 10000 });
+  const parsedColumns: number[] = [];
+  const drain = createNativeTerminalOutputDrain({
+    write: async (text) => {
+      parsedColumns.push(terminal.getViewportState().cols);
+      await terminal.write(text);
+    },
+    reset: (size) => {
+      if (size) terminal.resize(size);
+      terminal.reset();
+    },
+    restoreSize: () => terminal.resize(measured),
+    getViewportState: () => terminal.getViewportState(),
+    onPaint: () => {},
+  });
+  try {
+    drain.replay({ type: "begin", rows: 30, cols: 120 });
+    drain.replay({ type: "data", data: new TextEncoder().encode("x".repeat(100) + "\r\n") });
+    measured = resolveMeasuredNativeTerminalSize({
+      layout: { width: 500, height: 100 },
+      metrics: { cellWidth: 10, cellHeight: 10 },
+    })!;
+    drain.resize();
+    drain.replay({ type: "end" });
+    drain.enqueueText("\x1b[H\x1b[2K\x1b[31mLIVE-界🙂\x1b[0m");
+    await drain.flush();
+    expect(parsedColumns).toEqual([120, 50]);
+    const state = terminal.getViewportState();
+    const frame = buildTerminalFrame({ state, columns: state.cols, resolver, selection: null });
+    expect(frame.columns).toBe(50);
+    expect(frame.rows).toHaveLength(10);
+    expect(frame.rows[0].text.trimEnd()).toBe("LIVE-界🙂");
+    expect(frame.rows[0].styles.slice(0, 4)).toEqual([8, RED, 0, 0]);
+    expect(encodeTerminalFrame(frame).rows[0]).toContain("LIVE-界🙂");
+  } finally {
+    drain.dispose();
+    terminal.dispose();
+  }
 });
