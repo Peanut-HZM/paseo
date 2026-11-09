@@ -23,6 +23,30 @@ function writeMiniMaxCredentials(
   writeFileSync(join(dir, ".mmx", "credentials.json"), JSON.stringify(payload));
 }
 
+/**
+ * The CLI's own auth store keeps the account's token nested under a record
+ * id, alongside its own metadata, instead of the flat credentials file. The
+ * region is in the path the CLI signed in from.
+ */
+function writeMiniMaxAuthState(dir: string, accessToken: string, expiresAtMs: number): void {
+  const file = join(dir, ".minimax", "auth", "prod", "cn", "mcode-public", "auth.json");
+  mkdirSync(join(file, ".."), { recursive: true });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      schemaVersion: 1,
+      records: {
+        "com.minimax.mcode.oauth.prod.cn\u0000clientid": {
+          schemaVersion: 1,
+          accessToken,
+          tokenType: "Bearer",
+          expiresAtMs,
+        },
+      },
+    }),
+  );
+}
+
 function mockFetch(handlers: Map<string, () => Response>): typeof fetch {
   return vi.fn(async (url: RequestInfo | URL) => {
     const key = url.toString();
@@ -131,7 +155,7 @@ describe("minimax usage source", () => {
 
     const miniMax = findProvider(await service().listUsage(), "minimax");
 
-    expect(requestedUrl).toBe("https://api.minimax.io/v1/token_plan/remains");
+    expect(requestedUrl).toBe("https://api.minimax.io/v1/api/openplatform/coding_plan/remains");
     expect(authorization).toBe("Bearer minimax_test_token");
     expect(miniMax).toMatchObject({
       status: "available",
@@ -150,6 +174,44 @@ describe("minimax usage source", () => {
           remainingPct: 76,
           resetsAt: "2026-06-26T00:00:00.000Z",
         }),
+      ]),
+    });
+  });
+
+  it("discovers the CLI auth state and hits the coding-plan endpoint", async () => {
+    writeMiniMaxAuthState(homeDir, "minimax_auth_state_token", Date.now() + 60_000);
+    let requestedUrl: string | null = null;
+    let authorization: string | null = null;
+    fetchApi = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      requestedUrl = url.toString();
+      authorization = (init?.headers as Record<string, string> | undefined)?.Authorization ?? null;
+      return jsonResponse({
+        model_remains: [
+          {
+            model_name: "MiniMax-M2.7",
+            end_time: Date.parse("2026-06-19T05:00:00.000Z"),
+            weekly_end_time: Date.parse("2026-06-26T00:00:00.000Z"),
+            current_interval_total_count: 1000,
+            current_interval_usage_count: 250,
+            current_interval_remaining_percent: 75,
+            current_weekly_total_count: 5000,
+            current_weekly_usage_count: 1200,
+            current_weekly_remaining_percent: 76,
+          },
+        ],
+      });
+    }) as unknown as typeof fetch;
+
+    const accounts = await discover();
+    expect(accounts).toHaveLength(1);
+
+    const miniMax = findProvider(await service().listUsage(), "minimax");
+    expect(requestedUrl).toBe("https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains");
+    expect(authorization).toBe("Bearer minimax_auth_state_token");
+    expect(miniMax).toMatchObject({
+      status: "available",
+      windows: expect.arrayContaining([
+        expect.objectContaining({ id: "interval_MiniMax-M2.7", usedPct: 25 }),
       ]),
     });
   });
@@ -173,7 +235,9 @@ describe("minimax usage source", () => {
 
     await service().listUsage();
 
-    expect(requestedUrl).toBe("https://account.example.com/v1/token_plan/remains");
+    expect(requestedUrl).toBe(
+      "https://account.example.com/v1/api/openplatform/coding_plan/remains",
+    );
   });
 
   it("falls back to MiniMax api_key in the CLI config file", async () => {
@@ -189,7 +253,7 @@ describe("minimax usage source", () => {
 
     const miniMax = findProvider(await service().listUsage(), "minimax");
 
-    expect(requestedUrl).toBe("https://api.minimaxi.com/v1/token_plan/remains");
+    expect(requestedUrl).toBe("https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains");
     expect(miniMax.status).toBe("unavailable");
   });
 
@@ -198,7 +262,7 @@ describe("minimax usage source", () => {
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.minimaxi.com/v1/token_plan/remains",
+          "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
           () =>
             jsonResponse({
               model_remains: null,
@@ -222,7 +286,7 @@ describe("minimax usage source", () => {
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.minimax.io/v1/token_plan/remains",
+          "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
           () => jsonResponse({ model_remains: null }),
         ],
       ]),
@@ -242,7 +306,7 @@ describe("minimax usage source", () => {
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.minimax.io/v1/token_plan/remains",
+          "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
           () =>
             jsonResponse({
               base_resp: { status_code: 0, status_msg: "success" },
@@ -275,7 +339,7 @@ describe("minimax usage source", () => {
     fetchApi = mockFetch(
       new Map([
         [
-          "https://api.minimax.io/v1/token_plan/remains",
+          "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
           () =>
             jsonResponse({
               model_remains: [
@@ -318,9 +382,14 @@ describe("minimax usage source", () => {
 });
 
 it("discovery returns a locator when fetch finds minimax credentials", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const directory = await mkdtemp(join(tmpdir(), "usage-env-only-"));
   const previous = process.env["MINIMAX_API_KEY"];
+  const original = { ...process.env };
   try {
     process.env["MINIMAX_API_KEY"] = "fixture-token";
+    process.env.HOME = directory;
+    process.env.USERPROFILE = directory;
     let requested = false;
     await fetchFirst(async () => {
       requested = true;
@@ -331,8 +400,11 @@ it("discovery returns a locator when fetch finds minimax credentials", async () 
       { key: "default", input: { store: "env", locator: "MINIMAX_API_KEY" } },
     ]);
   } finally {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, original);
     if (previous === undefined) delete process.env["MINIMAX_API_KEY"];
     else process.env["MINIMAX_API_KEY"] = previous;
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

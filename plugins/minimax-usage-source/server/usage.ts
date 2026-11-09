@@ -68,6 +68,24 @@ const MiniMaxConfigSchema = z.object({
   oauth: MiniMaxCredentialsSchema.optional(),
 });
 
+/**
+ * The CLI's own auth store: the account token lives under a nested record id
+ * alongside its own metadata, rather than as a flat credentials object.
+ */
+const MiniMaxAuthStateSchema = z.object({
+  schemaVersion: z.number().optional(),
+  records: z.record(
+    z.string(),
+    z.object({
+      schemaVersion: z.number().optional(),
+      accessToken: z.string().optional(),
+      refreshToken: z.string().optional(),
+      tokenType: z.string().optional(),
+      expiresAtMs: z.number().optional(),
+    }),
+  ),
+});
+
 type MiniMaxModelRemain = z.infer<typeof MiniMaxModelRemainSchema>;
 
 interface MiniMaxResolvedAuth {
@@ -154,7 +172,7 @@ export async function fetchUsage(
   if (auth.expiresAt && Date.parse(auth.expiresAt) <= Date.now())
     return unavailable({ kind: "expired", expiresAt: new Date(auth.expiresAt).toISOString() });
 
-  const res = await fetchApi(`${auth.baseUrl}/v1/token_plan/remains`, {
+  const res = await fetchApi(`${auth.baseUrl}/v1/api/openplatform/coding_plan/remains`, {
     signal: AbortSignal.timeout(15_000),
     headers: {
       Authorization: `Bearer ${auth.token}`,
@@ -198,6 +216,34 @@ export async function fetchUsage(
   };
 }
 
+async function readAuthStateFile(
+  file: string,
+  region?: string,
+): Promise<(MiniMaxResolvedAuth & { expiresAt?: string }) | undefined> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+  const auth = MiniMaxAuthStateSchema.parse(raw);
+  for (const record of Object.values(auth.records)) {
+    if (record.accessToken) {
+      return {
+        token: record.accessToken,
+        // The auth-state store does not carry a base url; the region the CLI
+        // signed in from decides which API host bills the account's plan.
+        baseUrl: resolveBaseUrl({ region }),
+        expiresAt:
+          typeof record.expiresAtMs === "number"
+            ? new Date(record.expiresAtMs).toISOString()
+            : undefined,
+      };
+    }
+  }
+  return undefined;
+}
+
 async function readAuth(
   input: UsageInput,
 ): Promise<(MiniMaxResolvedAuth & { expiresAt?: string }) | undefined> {
@@ -208,6 +254,27 @@ async function readAuth(
       : undefined;
   }
   try {
+    if (input.store === "auth-state") {
+      // The store nests auth.json under <env>/<region>/<audience>/ directories,
+      // so walk the tree and read every auth state present. The region is in
+      // the path the CLI signed in from, and decides the API host.
+      let found: (MiniMaxResolvedAuth & { expiresAt?: string }) | undefined;
+      const walk = async (dir: string, region?: string): Promise<void> => {
+        if (found) return;
+        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (found) return;
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            await walk(full, entry.name === "cn" || entry.name === "global" ? entry.name : region);
+          } else if (entry.name === "auth.json") {
+            found = await readAuthStateFile(full, region);
+          }
+        }
+      };
+      await walk(input.locator);
+      return found;
+    }
     const raw: unknown = JSON.parse(await fs.readFile(input.locator, "utf8"));
     if (input.store === "credentials") {
       const credentials = MiniMaxCredentialsSchema.parse(raw);
@@ -244,6 +311,12 @@ export async function discover(): Promise<UsageAccount[]> {
     { store: "env", locator: "MINIMAX_API_KEY" },
     { store: "credentials", locator: join(homedir(), ".mmx", "credentials.json") },
     { store: "config", locator: join(homedir(), ".mmx", "config.json") },
+    // The CLI's own store: the account token lives under the region/audience
+    // directory the CLI signed in from, so scan for any auth.json under it.
+    {
+      store: "auth-state",
+      locator: join(homedir(), ".minimax", "auth"),
+    },
   ];
   const accounts: UsageAccount[] = [];
   for (const input of candidates)
